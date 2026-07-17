@@ -1,0 +1,37 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/windows"
+    },
+    {
+      "name": "android-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/android-${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+        "ANDROID_PLATFORM": "26",
+        "ANDROID_STL": "c++_static",
+        "CMAKE_BUILD_TYPE": "Release",
+        "SYNCER_BUILD_TESTS": "OFF"
+      }
+    },
+    { "name": "arm64-v8a", "inherits": "android-base", "cacheVariables": { "ANDROID_ABI": "arm64-v8a" } },
+    { "name": "armeabi-v7a", "inherits": "android-base", "cacheVariables": { "ANDROID_ABI": "armeabi-v7a" } },
+    { "name": "x86_64", "inherits": "android-base", "cacheVariables": { "ANDROID_ABI": "x86_64" } },
+    { "name": "x86", "inherits": "android-base", "cacheVariables": { "ANDROID_ABI": "x86" } }
+  ],
+  "buildPresets": [
+    { "name": "windows", "configurePreset": "windows", "configuration": "Release" },
+    { "name": "arm64-v8a", "configurePreset": "arm64-v8a" },
+    { "name": "armeabi-v7a", "configurePreset": "armeabi-v7a" },
+    { "name": "x86_64", "configurePreset": "x86_64" },
+    { "name": "x86", "configurePreset": "x86" }
+  ]
+}
