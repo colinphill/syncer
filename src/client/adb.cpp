@@ -1,5 +1,6 @@
 #include "adb.hpp"
 
+#include "syncer/blake3.hpp"
 #include "syncer/version.hpp"
 
 #include <algorithm>
@@ -47,6 +48,20 @@ fs::path executable_directory() {
     if (length == 0 || length == buffer.size()) throw Error(ExitCode::adb, "cannot determine client installation directory");
     buffer.resize(length);
     return fs::path(buffer).parent_path();
+}
+
+std::string file_digest(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw Error(ExitCode::adb, "cannot read packaged Android server");
+    Blake3 hash;
+    std::array<std::uint8_t, 64U * 1024U> buffer{};
+    while (input) {
+        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const auto count = static_cast<std::size_t>(input.gcount());
+        if (count != 0) hash.update(std::span(buffer.data(), count));
+    }
+    if (input.bad()) throw Error(ExitCode::adb, "cannot read packaged Android server");
+    return digest_hex(hash.finalize());
 }
 
 } // namespace
@@ -119,9 +134,12 @@ std::string Adb::deploy_server() {
     const auto abi = query_abi();
     const auto local = executable_directory() / "servers" / widen(abi) / "syncerd";
     if (!fs::is_regular_file(local)) throw Error(ExitCode::adb, "packaged Android server is missing: " + narrow(local.wstring()));
-    const std::string directory = std::string("/data/local/tmp/syncer/") + kVersion;
+    const auto digest = file_digest(local);
+    const std::string directory = std::string("/data/local/tmp/syncer/") + kVersion + "/" + digest;
     const std::string remote = directory + "/syncerd";
-    auto result = run({L"shell", L"mkdir", L"-p", widen(directory)});
+    auto result = run({L"shell", L"test", L"-x", widen(remote)});
+    if (result.exit_code == 0) return remote;
+    result = run({L"shell", L"mkdir", L"-p", widen(directory)});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot create Android deployment directory: " + trim(result.output));
     result = run({L"push", local.wstring(), widen(remote)});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot deploy Android server: " + trim(result.output));

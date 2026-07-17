@@ -3,7 +3,7 @@
 #include "syncer/manifest.hpp"
 
 #include <filesystem>
-#include <map>
+#include <unordered_map>
 
 namespace syncer::client {
 
@@ -14,7 +14,7 @@ struct SourceFile {
 
 struct SourceTree {
     Manifest manifest;
-    std::map<std::string, SourceFile, std::less<>> files;
+    std::unordered_map<std::string, SourceFile> files;
 };
 
 [[nodiscard]] SourceTree scan_source(const std::filesystem::path& root, const GlobSet& exclusions);

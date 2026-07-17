@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace syncer::server {
 
@@ -70,7 +71,7 @@ private:
     std::uint64_t upload_counter_{};
     std::unique_ptr<Upload> upload_;
     std::map<std::string, StagedFile, std::less<>> staged_;
-    std::map<std::string, LogicalTime, std::less<>> logical_times_;
+    std::unordered_map<std::string, LogicalTime> logical_times_;
     bool metadata_dirty_{};
     bool stop_{};
 };

@@ -40,9 +40,16 @@ GlobSet::GlobSet(std::vector<std::string> patterns) : patterns_(std::move(patter
     }
 }
 
-bool GlobSet::matches(std::string_view relative_path) const {
+bool GlobSet::matches_exact(std::string_view relative_path) const {
     for (const auto& pattern : patterns_) {
         if (glob_match(pattern, relative_path)) return true;
+    }
+    return false;
+}
+
+bool GlobSet::matches(std::string_view relative_path) const {
+    if (matches_exact(relative_path)) return true;
+    for (const auto& pattern : patterns_) {
         std::size_t slash = relative_path.size();
         while ((slash = relative_path.rfind('/', slash == 0 ? 0 : slash - 1)) != std::string_view::npos) {
             if (glob_match(pattern, relative_path.substr(0, slash))) return true;

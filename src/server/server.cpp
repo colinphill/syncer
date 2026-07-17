@@ -11,18 +11,23 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <dirent.h>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -346,6 +351,10 @@ void Server::load_metadata() {
     if (reader.string() != "SYNCER-TIMESTAMPS" || reader.u32() != 1)
         throw Error(ExitCode::safety, "destination timestamp catalog has an unsupported format");
     const auto count = reader.u32();
+    constexpr std::size_t minimum_catalog_entry_size = 4U + 1U + 1U + 8U + 8U;
+    if (count > maximum_size / minimum_catalog_entry_size)
+        throw Error(ExitCode::safety, "destination timestamp catalog entry count exceeds limit");
+    logical_times_.reserve(count);
     for (std::uint32_t index = 0; index < count; ++index) {
         auto relative = reader.string();
         const auto type = static_cast<EntryType>(reader.u8());
@@ -358,6 +367,14 @@ void Server::load_metadata() {
             throw Error(ExitCode::safety, "destination timestamp catalog contains an invalid entry");
     }
     reader.require_end();
+    for (auto iterator = logical_times_.begin(); iterator != logical_times_.end();) {
+        if (iterator->second.type == EntryType::directory) {
+            iterator = logical_times_.erase(iterator);
+            metadata_dirty_ = true;
+        } else {
+            ++iterator;
+        }
+    }
 }
 
 void Server::save_metadata() {
@@ -416,6 +433,8 @@ fs::path Server::destination_path(std::string_view relative, bool ensure_parents
 void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     require_root();
     constexpr std::size_t batch_limit = 512U * 1024U;
+    constexpr std::size_t worker_batch_entries = 256;
+    constexpr std::size_t queued_batch_limit = 8;
     std::vector<ManifestEntry> batch;
     std::size_t batch_bytes{};
     const auto flush = [&] {
@@ -434,56 +453,148 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
         batch.push_back(std::move(entry));
     };
 
-    std::function<void(const fs::path&, const std::string&, std::size_t)> walk;
-    walk = [&](const fs::path& directory_path, const std::string& parent, std::size_t depth) {
-        if (depth > 1024) throw Error(ExitCode::transfer, "destination directory nesting exceeds limit");
-        std::unique_ptr<DIR, int(*)(DIR*)> directory(::opendir(directory_path.c_str()), ::closedir);
-        if (!directory) throw Error(ExitCode::transfer, "cannot open destination directory");
+    struct DirectoryTask {
+        fs::path physical;
+        std::string relative;
+        std::size_t depth{};
+    };
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<DirectoryTask> directories;
+    std::deque<std::vector<ManifestEntry>> completed_batches;
+    directories.push_back({root_, {}, 0});
+    std::size_t outstanding_directories = 1;
+    bool finished{};
+    bool stopping{};
+    std::exception_ptr failure;
+
+    const auto fail = [&](std::exception_ptr error) {
+        std::lock_guard lock(mutex);
+        if (!failure) failure = std::move(error);
+        stopping = true;
+        directories.clear();
+        ready.notify_all();
+    };
+    const auto publish = [&](std::vector<ManifestEntry>& entries) {
+        if (entries.empty()) return true;
+        std::unique_lock lock(mutex);
+        ready.wait(lock, [&] { return stopping || completed_batches.size() < queued_batch_limit; });
+        if (stopping) return false;
+        completed_batches.push_back(std::move(entries));
+        entries.clear();
+        entries.reserve(worker_batch_entries);
+        ready.notify_all();
+        return true;
+    };
+    const auto worker = [&] {
         while (true) {
-            errno = 0;
-            const auto* native = ::readdir(directory.get());
-            if (!native) {
-                if (errno != 0) throw Error(ExitCode::transfer, "cannot enumerate destination directory");
-                break;
+            DirectoryTask task;
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock, [&] { return stopping || !directories.empty(); });
+                if (stopping) return;
+                task = std::move(directories.front());
+                directories.pop_front();
             }
-            const std::string name(native->d_name);
-            if (name == "." || name == "..") continue;
-            const auto relative = parent.empty() ? name : parent + "/" + name;
-            if (parent.empty() && relative == kReservedDirectory) continue;
-            if (!valid_relative_path(relative)) throw Error(ExitCode::safety, "destination contains an invalid path");
-            struct stat value{};
-            if (::fstatat(::dirfd(directory.get()), native->d_name, &value, AT_SYMLINK_NOFOLLOW) != 0)
-                throw Error(ExitCode::transfer, "cannot inspect destination entry");
-            ManifestEntry entry;
-            entry.path = relative;
-            entry.size = S_ISREG(value.st_mode) ? static_cast<std::uint64_t>(value.st_size) : 0;
-            entry.modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec);
-            if (S_ISREG(value.st_mode)) entry.type = EntryType::file;
-            else if (S_ISDIR(value.st_mode)) entry.type = EntryType::directory;
-            else entry.type = EntryType::other;
-            const auto logical = logical_times_.find(relative);
-            if (logical != logical_times_.end() && logical->second.type == entry.type &&
-                (entry.type != EntryType::file || logical->second.size == entry.size))
-                entry.modified_seconds = logical->second.modified_seconds;
-            emit(entry);
-            if (entry.type == EntryType::directory) walk(directory_path / fs::path(name), relative, depth + 1);
+            try {
+                if (task.depth > 1024)
+                    throw Error(ExitCode::transfer, "destination directory nesting exceeds limit");
+                std::unique_ptr<DIR, int(*)(DIR*)> directory(::opendir(task.physical.c_str()), ::closedir);
+                if (!directory) throw Error(ExitCode::transfer, "cannot open destination directory");
+                std::vector<ManifestEntry> entries;
+                entries.reserve(worker_batch_entries);
+                while (true) {
+                    errno = 0;
+                    const auto* native = ::readdir(directory.get());
+                    if (!native) {
+                        if (errno != 0) throw Error(ExitCode::transfer, "cannot enumerate destination directory");
+                        break;
+                    }
+                    const std::string name(native->d_name);
+                    if (name == "." || name == "..") continue;
+                    const auto relative = task.relative.empty() ? name : task.relative + "/" + name;
+                    if (task.relative.empty() && relative == kReservedDirectory) continue;
+                    if (!valid_relative_path(relative))
+                        throw Error(ExitCode::safety, "destination contains an invalid path");
+                    struct stat value{};
+                    if (::fstatat(::dirfd(directory.get()), native->d_name, &value, AT_SYMLINK_NOFOLLOW) != 0)
+                        throw Error(ExitCode::transfer, "cannot inspect destination entry");
+                    ManifestEntry entry;
+                    entry.path = relative;
+                    entry.size = S_ISREG(value.st_mode) ? static_cast<std::uint64_t>(value.st_size) : 0;
+                    entry.modified_seconds = S_ISREG(value.st_mode) ?
+                        static_cast<std::int64_t>(value.st_mtim.tv_sec) : 0;
+                    if (S_ISREG(value.st_mode)) entry.type = EntryType::file;
+                    else if (S_ISDIR(value.st_mode)) entry.type = EntryType::directory;
+                    else entry.type = EntryType::other;
+                    const auto logical = logical_times_.find(relative);
+                    if (logical != logical_times_.end() && logical->second.type == entry.type &&
+                        (entry.type != EntryType::file || logical->second.size == entry.size))
+                        entry.modified_seconds = logical->second.modified_seconds;
+                    if (entry.type == EntryType::directory) {
+                        std::lock_guard lock(mutex);
+                        directories.push_back({task.physical / fs::path(name), relative, task.depth + 1});
+                        ++outstanding_directories;
+                        ready.notify_all();
+                    }
+                    entries.push_back(std::move(entry));
+                    if (entries.size() == worker_batch_entries && !publish(entries)) return;
+                }
+                if (!publish(entries)) return;
+                {
+                    std::lock_guard lock(mutex);
+                    if (--outstanding_directories == 0) {
+                        finished = true;
+                        stopping = true;
+                    }
+                    ready.notify_all();
+                }
+            } catch (...) {
+                fail(std::current_exception());
+                return;
+            }
         }
     };
-    walk(root_, {}, 0);
+
+    const auto hardware_threads = std::thread::hardware_concurrency();
+    const auto worker_count = std::clamp(hardware_threads == 0 ? 4U : hardware_threads, 1U, 4U);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (unsigned index = 0; index < worker_count; ++index) workers.emplace_back(worker);
+        while (true) {
+            std::vector<ManifestEntry> entries;
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock, [&] { return failure || !completed_batches.empty() || finished; });
+                if (failure) break;
+                if (completed_batches.empty()) {
+                    if (finished) break;
+                    continue;
+                }
+                entries = std::move(completed_batches.front());
+                completed_batches.pop_front();
+                ready.notify_all();
+            }
+            for (auto& entry : entries) emit(std::move(entry));
+        }
+    } catch (...) {
+        fail(std::current_exception());
+    }
+    for (auto& thread : workers) thread.join();
+    if (failure) std::rethrow_exception(failure);
     flush();
     send_frame(client, Frame{MessageType::manifest_end, request_id, {}});
 }
 
 void Server::make_directory(ByteReader& reader) {
     const auto relative = reader.string();
-    const auto seconds = reader.i64();
+    (void)reader.i64(); // Retained on the wire for protocol compatibility; directory times are ignored.
     const auto path = destination_path(relative, true);
     const auto status = fs::symlink_status(path);
     if (fs::exists(status) && !fs::is_directory(status)) fs::remove_all(path);
     fs::create_directories(path);
-    apply_mtime(path, seconds);
-    logical_times_[relative] = LogicalTime{EntryType::directory, 0, seconds};
-    metadata_dirty_ = true;
+    if (logical_times_.erase(relative) != 0) metadata_dirty_ = true;
 }
 
 void Server::put_begin(ByteReader& reader) {
@@ -574,8 +685,12 @@ void Server::set_mtime(ByteReader& reader) {
     const auto seconds = reader.i64();
     const auto status = fs::symlink_status(destination);
     if (!fs::exists(status) || fs::is_symlink(status)) throw Error(ExitCode::safety, "cannot set time on missing or linked destination");
-    apply_mtime(destination, seconds);
     const auto type = fs::is_directory(status) ? EntryType::directory : EntryType::file;
+    if (type == EntryType::directory) {
+        if (logical_times_.erase(relative) != 0) metadata_dirty_ = true;
+        return;
+    }
+    apply_mtime(destination, seconds);
     const auto size = type == EntryType::file ? fs::file_size(destination) : 0;
     logical_times_[relative] = LogicalTime{type, size, seconds};
     metadata_dirty_ = true;

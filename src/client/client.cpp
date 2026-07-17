@@ -98,6 +98,7 @@ Manifest ClientSession::scan(std::string_view device_path) {
     const auto request = next_request();
     send_frame(socket_, Frame{MessageType::scan, request, std::move(writer).take()});
     Manifest manifest;
+    manifest.reserve(4096);
     while (true) {
         const auto response = receive_frame(socket_);
         if (response.type == MessageType::error) {
@@ -116,6 +117,7 @@ Manifest ClientSession::scan(std::string_view device_path) {
         } else if (response.type == MessageType::manifest_batch) {
             const auto count = entry_reader.u32();
             if (count > 100000) throw Error(ExitCode::transfer, "destination manifest batch entry count exceeds limit");
+            manifest.reserve(manifest.size() + count);
             for (std::uint32_t index = 0; index < count; ++index) add_entry(decode_manifest_entry(entry_reader));
         } else {
             throw Error(ExitCode::transfer, "invalid destination manifest response");
@@ -164,10 +166,6 @@ void ClientSession::commit_file(std::string_view path) {
 }
 void ClientSession::delete_path(std::string_view path) {
     ByteWriter writer; writer.string(path); operation(MessageType::delete_path, std::move(writer).take());
-}
-void ClientSession::set_mtime(const ManifestEntry& entry) {
-    ByteWriter writer; writer.string(entry.path); writer.i64(entry.modified_seconds);
-    operation(MessageType::set_mtime, std::move(writer).take());
 }
 void ClientSession::shutdown() noexcept {
     if (!socket_.is_open()) return;

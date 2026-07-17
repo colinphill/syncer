@@ -24,7 +24,6 @@ public:
     void make_directory(const ManifestEntry& entry);
     void commit_file(std::string_view path);
     void delete_path(std::string_view path);
-    void set_mtime(const ManifestEntry& entry);
     void shutdown() noexcept;
 private:
     [[nodiscard]] std::uint32_t next_request() { return ++request_id_; }

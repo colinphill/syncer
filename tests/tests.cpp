@@ -61,6 +61,8 @@ void test_globs() {
     CHECK(!syncer::glob_match("file?.txt", "file12.txt"));
     CHECK(!syncer::glob_match("README", "readme"));
     syncer::GlobSet set({"build", "**/*.tmp"});
+    CHECK(set.matches_exact("build"));
+    CHECK(!set.matches_exact("build/output.bin"));
     CHECK(set.matches("build/output.bin"));
     CHECK(set.matches("build/deep/output.bin"));
     CHECK(set.matches("a/b/cache.tmp"));
@@ -87,6 +89,40 @@ void test_paths_and_plan() {
     CHECK(plan.files.size() == 1);
     CHECK(plan.deletions.size() == 1);
     CHECK(plan.transfer_bytes == 20);
+    CHECK(plan.directories[0].action == syncer::PlanAction::create_directory);
+    CHECK(plan.directories[0].reason == "destination path is missing");
+    CHECK(plan.files[0].action == syncer::PlanAction::add_file);
+    CHECK(plan.files[0].reason == "destination path is missing");
+    CHECK(plan.deletions[0].action == syncer::PlanAction::delete_file);
+    CHECK(plan.deletions[0].reason == "path exists only at the destination and deletion is enabled");
+
+    syncer::Manifest reason_source, reason_destination;
+    reason_source.emplace("changed.bin", syncer::ManifestEntry{"changed.bin", syncer::EntryType::file, 9, 20});
+    reason_destination.emplace("changed.bin", syncer::ManifestEntry{"changed.bin", syncer::EntryType::file, 8, -100});
+    reason_source.emplace("was-file", syncer::ManifestEntry{"was-file", syncer::EntryType::directory, 0, 30});
+    reason_destination.emplace("was-file", syncer::ManifestEntry{"was-file", syncer::EntryType::file, 4, 30});
+    const auto reasons = syncer::make_plan(reason_source, reason_destination, syncer::GlobSet{}, true);
+    CHECK(reasons.files.size() == 1);
+    CHECK(reasons.files[0].action == syncer::PlanAction::update_file);
+    CHECK(reasons.files[0].reason.find("size differs") != std::string::npos);
+    CHECK(reasons.files[0].reason.find("modification time differs") != std::string::npos);
+    CHECK(reasons.directories.size() == 1);
+    CHECK(reasons.directories[0].action == syncer::PlanAction::replace_with_directory);
+    CHECK(reasons.directories[0].reason == "destination path is a file");
+
+    syncer::Manifest tolerance_source, tolerance_destination;
+    tolerance_source.emplace("near.txt", syncer::ManifestEntry{"near.txt", syncer::EntryType::file, 5, 100});
+    tolerance_source.emplace("near-dir", syncer::ManifestEntry{"near-dir", syncer::EntryType::directory, 0, 100});
+    tolerance_destination.emplace("near.txt", syncer::ManifestEntry{"near.txt", syncer::EntryType::file, 5, 40});
+    tolerance_destination.emplace("near-dir", syncer::ManifestEntry{"near-dir", syncer::EntryType::directory, 0, 41});
+    const auto tolerated = syncer::make_plan(tolerance_source, tolerance_destination, syncer::GlobSet{}, true);
+    CHECK(tolerated.files.empty());
+    CHECK(tolerated.directories.empty());
+    const auto exact = syncer::make_plan(tolerance_source, tolerance_destination, syncer::GlobSet{}, true, 0);
+    CHECK(exact.files.size() == 1);
+    CHECK(exact.directories.empty());
+    CHECK(exact.files[0].reason.find("differs by 60 seconds") != std::string::npos);
+    CHECK(exact.files[0].reason.find("tolerance 0 seconds") != std::string::npos);
 
     syncer::Manifest ordered_source, ordered_destination;
     ordered_source.emplace("a", syncer::ManifestEntry{"a", syncer::EntryType::directory, 0, 1});
@@ -97,11 +133,11 @@ void test_paths_and_plan() {
     ordered_destination.emplace("protected/keep.bin", syncer::ManifestEntry{"protected/keep.bin", syncer::EntryType::file, 1, 1});
     const auto ordered = syncer::make_plan(ordered_source, ordered_destination, syncer::GlobSet({"protected"}), true);
     CHECK(ordered.directories.size() == 2);
-    CHECK(ordered.directories[0].path == "a");
-    CHECK(ordered.directories[1].path == "a/b");
+    CHECK(ordered.directories[0].entry.path == "a");
+    CHECK(ordered.directories[1].entry.path == "a/b");
     CHECK(ordered.deletions.size() == 2);
-    CHECK(ordered.deletions[0].path == "old/deep.bin");
-    CHECK(ordered.deletions[1].path == "old");
+    CHECK(ordered.deletions[0].entry.path == "old/deep.bin");
+    CHECK(ordered.deletions[1].entry.path == "old");
     CHECK(syncer::make_plan(ordered_source, ordered_destination, syncer::GlobSet{}, false).deletions.empty());
 }
 
@@ -158,6 +194,7 @@ void test_source_scan() {
     { std::ofstream(root / "ignored.tmp", std::ios::binary) << "ignored"; }
     const auto tree = syncer::client::scan_source(root, syncer::GlobSet({"**/*.tmp"}));
     CHECK(tree.manifest.contains("nested"));
+    CHECK(tree.manifest.at("nested").modified_seconds == 0);
     CHECK(tree.manifest.contains("nested/file.txt"));
     CHECK(tree.manifest.contains("unicode-\xce\xb1.txt"));
     CHECK(!tree.manifest.contains("ignored.tmp"));

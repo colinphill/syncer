@@ -93,6 +93,8 @@ SourceTree scan_source(const fs::path& requested_root, const GlobSet& exclusions
     const auto root = fs::canonical(requested_root, error);
     if (error || !fs::is_directory(root)) throw Error(ExitCode::safety, "source must be an accessible directory");
     SourceTree tree;
+    tree.manifest.reserve(4096);
+    tree.files.reserve(4096);
     std::vector<std::wstring> ancestors;
 
     std::function<void(const fs::path&, const std::string&, bool, FileFacts)> walk;
@@ -100,7 +102,9 @@ SourceTree scan_source(const fs::path& requested_root, const GlobSet& exclusions
         if (!is_root) {
             if (path_depth(logical) == 1 && logical == kReservedDirectory)
                 throw Error(ExitCode::safety, "source contains the reserved top-level .syncer path");
-            if (exclusions.matches(logical)) return;
+            // Excluded directories are pruned, so their descendants never reach
+            // this call. Matching ancestors again for every file is redundant.
+            if (exclusions.matches_exact(logical)) return;
         }
         fs::path effective = physical;
         if ((facts.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
@@ -115,7 +119,7 @@ SourceTree scan_source(const fs::path& requested_root, const GlobSet& exclusions
                 throw Error(ExitCode::safety, "source contains a recursive symbolic link or junction at: " + logical);
             ancestors.push_back(key);
             if (!is_root) {
-                ManifestEntry entry{logical, EntryType::directory, 0, modified_seconds(facts.modified)};
+                ManifestEntry entry{logical, EntryType::directory, 0, 0};
                 tree.manifest.emplace(logical, entry);
             }
             WIN32_FIND_DATAW child_data{};

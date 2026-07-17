@@ -16,6 +16,7 @@
 #include <chrono>
 #include <filesystem>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 
@@ -33,13 +34,14 @@ struct Options {
     bool dry_run{};
     bool json{};
     bool help{};
+    std::int64_t mtime_tolerance_seconds{60};
 };
 
 void usage() {
     std::cout << "syncer " << kVersion << "\n\n"
               << "Usage:\n"
               << "  syncer init [--adb PATH] [--serial SERIAL] [--adopt] DEVICE_PATH\n"
-              << "  syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--no-delete] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH\n"
+              << "  syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH\n"
               << "  syncer version\n";
 }
 
@@ -71,6 +73,8 @@ Options parse(int argc, wchar_t** argv) {
     } else {
         description.add_options()
             ("exclude", po::value<std::vector<std::string>>(&options.excludes)->composing(), "case-sensitive exclusion glob")
+            ("mtime-tolerance", po::value<std::int64_t>(&options.mtime_tolerance_seconds)->default_value(60),
+             "ignore modification-time differences up to this many seconds")
             ("no-delete", po::bool_switch(&options.no_delete), "keep destination-only paths")
             ("dry-run", po::bool_switch(&options.dry_run), "calculate without mutating")
             ("json", po::bool_switch(&options.json), "write JSON result to stdout")
@@ -84,6 +88,8 @@ Options parse(int argc, wchar_t** argv) {
     } catch (const po::error& error) {
         throw Error(ExitCode::usage, error.what());
     }
+    if (options.mtime_tolerance_seconds < 0)
+        throw Error(ExitCode::usage, "--mtime-tolerance cannot be negative");
     if (!adb_path.empty()) options.adb = std::filesystem::path(widen(adb_path));
     if (!serial.empty()) options.serial = serial;
     return options;
@@ -130,6 +136,35 @@ boost::json::object counts(std::size_t files, std::size_t directories, std::size
     return {{"files", files}, {"directories", directories}, {"deletions", deletions}, {"bytes", bytes}};
 }
 
+std::string_view action_name(PlanAction action) {
+    switch (action) {
+    case PlanAction::create_directory: return "CREATE DIRECTORY";
+    case PlanAction::replace_with_directory: return "REPLACE WITH DIRECTORY";
+    case PlanAction::add_file: return "ADD FILE";
+    case PlanAction::update_file: return "UPDATE FILE";
+    case PlanAction::replace_with_file: return "REPLACE WITH FILE";
+    case PlanAction::delete_file: return "DELETE FILE";
+    case PlanAction::delete_directory: return "DELETE DIRECTORY";
+    case PlanAction::delete_other: return "DELETE ENTRY";
+    }
+    return "CHANGE";
+}
+
+void print_changes(const SyncPlan& plan) {
+    if (plan.directories.empty() && plan.files.empty() && plan.deletions.empty()) {
+        std::cerr << "Selected changes: none\n";
+        return;
+    }
+    std::cerr << "Selected changes:\n";
+    const auto print = [](const PlannedChange& change) {
+        std::cerr << "  " << action_name(change.action) << ' ' << std::quoted(change.entry.path)
+                  << " -- " << change.reason << '\n';
+    };
+    for (const auto& change : plan.directories) print(change);
+    for (const auto& change : plan.files) print(change);
+    for (const auto& change : plan.deletions) print(change);
+}
+
 int execute(const Options& options) {
     if (options.help) { usage(); return 0; }
     if (options.command == "version") {
@@ -158,14 +193,16 @@ int execute(const Options& options) {
         std::cerr << "Scanning destination...\n";
         const auto destination = session.scan(options.positional[1]);
         const auto source = source_scan.get();
-        plan = make_plan(source.manifest, destination, exclusions, !options.no_delete);
+        plan = make_plan(source.manifest, destination, exclusions, !options.no_delete,
+                         static_cast<std::uint64_t>(options.mtime_tolerance_seconds));
+        print_changes(plan);
         if (options.dry_run) return;
         session.prepare();
         if (plan.files.empty() && plan.directories.empty() && plan.deletions.empty()) return;
-        for (const auto& entry : plan.files) {
-            std::cerr << "Staging " << entry.path << "\n";
-            session.stage(source.files.at(entry.path));
-            transferred_bytes += entry.size;
+        for (const auto& change : plan.files) {
+            std::cerr << "Staging " << change.entry.path << "\n";
+            session.stage(source.files.at(change.entry.path));
+            transferred_bytes += change.entry.size;
         }
         try {
             const auto current_source = scan_source(source_path, exclusions);
@@ -175,16 +212,9 @@ int execute(const Options& options) {
             if (error.code() == ExitCode::source_changed) throw;
             throw Error(ExitCode::source_changed, "source tree changed after it was scanned: " + std::string(error.what()));
         }
-        for (const auto& entry : plan.directories) { session.make_directory(entry); ++applied_directories; }
-        for (const auto& entry : plan.files) { session.commit_file(entry.path); ++applied_files; }
-        for (const auto& entry : plan.deletions) { session.delete_path(entry.path); ++applied_deletions; }
-        std::vector<ManifestEntry> directories;
-        for (const auto& [path, entry] : source.manifest) if (entry.type == EntryType::directory) directories.push_back(entry);
-        std::sort(directories.begin(), directories.end(), [](const auto& a, const auto& b) {
-            const auto a_depth = path_depth(a.path), b_depth = path_depth(b.path);
-            return a_depth > b_depth || (a_depth == b_depth && a.path > b.path);
-        });
-        for (const auto& entry : directories) session.set_mtime(entry);
+        for (const auto& change : plan.directories) { session.make_directory(change.entry); ++applied_directories; }
+        for (const auto& change : plan.files) { session.commit_file(change.entry.path); ++applied_files; }
+        for (const auto& change : plan.deletions) { session.delete_path(change.entry.path); ++applied_deletions; }
     });
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     if (options.json) {
@@ -193,6 +223,7 @@ int execute(const Options& options) {
         boost::json::object result{
             {"schema", 1}, {"status", status}, {"device", adb.serial()},
             {"source", options.positional[0]}, {"destination", options.positional[1]},
+            {"mtime_tolerance_seconds", options.mtime_tolerance_seconds},
             {"planned", counts(plan.files.size(), plan.directories.size(), plan.deletions.size(), plan.transfer_bytes)},
             {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes)},
             {"transferred_bytes", transferred_bytes},
