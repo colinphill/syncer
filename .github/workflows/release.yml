@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Select Android NDK
         shell: pwsh
@@ -91,7 +91,7 @@ jobs:
 
     steps:
       - name: Download release artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: syncer-release
           path: dist
