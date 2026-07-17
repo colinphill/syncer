@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: 27.3.13750724
+
+jobs:
+  package:
+    name: Build release package
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select Android NDK
+        shell: pwsh
+        run: |
+          $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+          if (-not $sdkRoot) { throw 'The runner does not provide an Android SDK.' }
+          $ndk = Join-Path $sdkRoot "ndk/$env:NDK_VERSION"
+          if (-not (Test-Path $ndk)) {
+            $sdkManagerCommand = Get-Command sdkmanager.bat -ErrorAction SilentlyContinue
+            if ($sdkManagerCommand) {
+              $sdkManagerPath = $sdkManagerCommand.Source
+            } else {
+              $sdkManagerPath = Join-Path $sdkRoot 'cmdline-tools/latest/bin/sdkmanager.bat'
+              if (-not (Test-Path $sdkManagerPath)) { throw 'sdkmanager.bat was not found.' }
+            }
+            & $sdkManagerPath --install "ndk;$env:NDK_VERSION"
+            if ($LASTEXITCODE -ne 0) { throw "Android NDK installation failed with exit code $LASTEXITCODE." }
+          }
+          "ANDROID_NDK_HOME=$ndk" >> $env:GITHUB_ENV
+
+      - name: Validate release version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path CMakeLists.txt -Pattern '^project\(syncer VERSION ([0-9]+\.[0-9]+\.[0-9]+) '
+          if (-not $match) { throw 'Could not read the project version from CMakeLists.txt.' }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match project version v$version."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build release package
+        shell: pwsh
+        run: ./scripts/build-package.ps1 -Configuration Release
+
+      - name: Run unit tests
+        shell: pwsh
+        run: ctest --test-dir out/build/windows -C Release --output-on-failure
+
+      - name: Create ZIP archive
+        id: archive
+        shell: pwsh
+        run: |
+          $archive = "out/package/syncer-v${{ steps.version.outputs.version }}-windows-x64.zip"
+          if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
+          Compress-Archive -Path 'out/package/syncer-Release/*' -DestinationPath $archive -CompressionLevel Optimal
+          "path=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: syncer-release
+          path: ${{ steps.archive.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: syncer-release
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="$(find dist -maxdepth 1 -name '*.zip' -print -quit)"
+          test -n "$asset"
+          gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --generate-notes

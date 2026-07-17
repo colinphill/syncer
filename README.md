@@ -1,5 +1,7 @@
 # syncer
 
+[![CI](https://github.com/colinphill/syncer/actions/workflows/ci.yml/badge.svg)](https://github.com/colinphill/syncer/actions/workflows/ci.yml)
+
 `syncer` is a one-shot C++20 tool that mirrors a Windows directory into a managed Android shared-storage directory over ADB. Its native Android server is deployed and run only for the duration of a command; it does not install an APK or leave a daemon running.
 
 Packaged server binaries are content-addressed when deployed, so an unchanged binary is reused on later commands instead of being pushed over ADB again.
@@ -29,6 +31,12 @@ scripts/build-package.ps1
 ```
 
 The packaging script builds `syncerd` for `arm64-v8a`, `armeabi-v7a`, `x86_64`, and `x86` and creates the runtime layout under `out/package/`.
+
+## CI/CD
+
+GitHub Actions builds and tests the Windows client plus all four Android server ABIs for pushes and pull requests targeting `main`. The workflow uses Android NDK `27.3.13750724`, matching the supported local toolchain.
+
+Pushing a tag matching the CMake project version, such as `v0.1.0`, creates a Windows x64 release ZIP and publishes it as a GitHub release with generated notes. The Release workflow can also be run manually to produce a downloadable workflow artifact without publishing a GitHub release.
 
 ## Usage
 

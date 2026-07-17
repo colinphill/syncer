@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.3.13750724
+
+jobs:
+  build-and-test:
+    name: Windows and Android
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select Android NDK
+        shell: pwsh
+        run: |
+          $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+          if (-not $sdkRoot) { throw 'The runner does not provide an Android SDK.' }
+          $ndk = Join-Path $sdkRoot "ndk/$env:NDK_VERSION"
+          if (-not (Test-Path $ndk)) {
+            $sdkManagerCommand = Get-Command sdkmanager.bat -ErrorAction SilentlyContinue
+            if ($sdkManagerCommand) {
+              $sdkManagerPath = $sdkManagerCommand.Source
+            } else {
+              $sdkManagerPath = Join-Path $sdkRoot 'cmdline-tools/latest/bin/sdkmanager.bat'
+              if (-not (Test-Path $sdkManagerPath)) { throw 'sdkmanager.bat was not found.' }
+            }
+            & $sdkManagerPath --install "ndk;$env:NDK_VERSION"
+            if ($LASTEXITCODE -ne 0) { throw "Android NDK installation failed with exit code $LASTEXITCODE." }
+          }
+          "ANDROID_NDK_HOME=$ndk" >> $env:GITHUB_ENV
+
+      - name: Build release package
+        shell: pwsh
+        run: ./scripts/build-package.ps1 -Configuration Release
+
+      - name: Run unit tests
+        shell: pwsh
+        run: ctest --test-dir out/build/windows -C Release --output-on-failure
+
+      - name: Verify package layout
+        shell: pwsh
+        run: |
+          $expected = @(
+            'out/package/syncer-Release/syncer.exe',
+            'out/package/syncer-Release/servers/arm64-v8a/syncerd',
+            'out/package/syncer-Release/servers/armeabi-v7a/syncerd',
+            'out/package/syncer-Release/servers/x86_64/syncerd',
+            'out/package/syncer-Release/servers/x86/syncerd'
+          )
+          foreach ($path in $expected) {
+            if (-not (Test-Path $path -PathType Leaf)) { throw "Missing package file: $path" }
+          }
+          & ./out/package/syncer-Release/syncer.exe version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged client failed with exit code $LASTEXITCODE." }

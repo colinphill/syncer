@@ -20,7 +20,9 @@ $ninja = Get-ChildItem $cmakeBundleRoot -Recurse -Filter ninja.exe -ErrorAction 
 if ($ninja) { $env:PATH = "$(Split-Path -Parent $ninja);$env:PATH" }
 
 & $cmake --preset windows
+if ($LASTEXITCODE -ne 0) { throw "Windows configuration failed with exit code $LASTEXITCODE." }
 & $cmake --build --preset windows --config $Configuration
+if ($LASTEXITCODE -ne 0) { throw "Windows build failed with exit code $LASTEXITCODE." }
 $boostSource = Join-Path $projectRoot 'out/build/windows/_deps/boost-src'
 foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) {
     if (Test-Path $boostSource) {
@@ -28,9 +30,12 @@ foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) {
     } else {
         & $cmake --preset $abi
     }
+    if ($LASTEXITCODE -ne 0) { throw "$abi configuration failed with exit code $LASTEXITCODE." }
     & $cmake --build --preset $abi
+    if ($LASTEXITCODE -ne 0) { throw "$abi build failed with exit code $LASTEXITCODE." }
 }
 
+if (Test-Path $packageRoot) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 Copy-Item (Join-Path $projectRoot "out/build/windows/$Configuration/syncer.exe") $packageRoot
 foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) {
