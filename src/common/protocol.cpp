@@ -78,4 +78,11 @@ ManifestEntry decode_manifest_entry(ByteReader& reader) {
     return entry;
 }
 
+UploadPlacement decode_upload_placement(ByteReader& reader) {
+    const auto value = reader.u8();
+    if (value > static_cast<std::uint8_t>(UploadPlacement::direct))
+        throw Error(ExitCode::transfer, "invalid upload placement mode");
+    return static_cast<UploadPlacement>(value);
+}
+
 } // namespace syncer

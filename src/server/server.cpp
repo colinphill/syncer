@@ -158,13 +158,16 @@ void Server::serve(LocalSocket& client) {
         } catch (const Error&) {
             // A client-side preflight or transfer failure closes the command-scoped
             // connection. Cleanup and release the root lock without noisy stderr.
+            discard_upload();
             return;
         }
         try {
             dispatch(client, frame);
         } catch (const Error& error) {
+            discard_upload();
             send_error(client, frame.request_id, error.code(), error.what());
         } catch (const std::exception& error) {
+            discard_upload();
             send_error(client, frame.request_id, ExitCode::transfer, error.what());
         }
     }
@@ -604,13 +607,24 @@ void Server::put_begin(ByteReader& reader) {
     if (!valid_relative_path(relative)) throw Error(ExitCode::safety, "invalid upload path");
     const auto expected_size = reader.u64();
     const auto seconds = reader.i64();
+    const bool direct = decode_upload_placement(reader) == UploadPlacement::direct;
     auto upload = std::make_unique<Upload>();
     upload->path = relative;
     upload->expected_size = expected_size;
     upload->modified_seconds = seconds;
-    upload->temporary_path = root_ / kReservedDirectory / "tmp" / (std::to_string(++upload_counter_) + ".part");
+    upload->direct = direct;
+    if (direct) {
+        upload->temporary_path = destination_path(relative, true);
+        const auto status = fs::symlink_status(upload->temporary_path);
+        if (fs::exists(status) && !fs::is_regular_file(status)) fs::remove_all(upload->temporary_path);
+    } else {
+        upload->temporary_path = root_ / kReservedDirectory / "tmp" /
+                                 (std::to_string(++upload_counter_) + ".part");
+    }
     upload->stream.open(upload->temporary_path, std::ios::binary | std::ios::trunc);
-    if (!upload->stream) throw Error(ExitCode::transfer, "cannot create temporary upload");
+    if (!upload->stream)
+        throw Error(ExitCode::transfer, direct ? "cannot create destination file" : "cannot create temporary upload");
+    if (direct && logical_times_.erase(relative) != 0) metadata_dirty_ = true;
     upload_ = std::move(upload);
 }
 
@@ -629,11 +643,26 @@ void Server::put_end(ByteReader& reader) {
     upload_->stream.close();
     const auto actual = upload_->hash.finalize();
     if (upload_->received_size != upload_->expected_size || !std::equal(actual.begin(), actual.end(), supplied.begin())) {
-        fs::remove(upload_->temporary_path);
-        upload_.reset();
+        discard_upload();
         throw Error(ExitCode::transfer, "uploaded file failed size or BLAKE3 verification");
     }
+    if (upload_->direct) {
+        apply_mtime(upload_->temporary_path, upload_->modified_seconds);
+        logical_times_[upload_->path] =
+            LogicalTime{EntryType::file, upload_->received_size, upload_->modified_seconds};
+        metadata_dirty_ = true;
+        upload_.reset();
+        return;
+    }
     staged_[upload_->path] = StagedFile{upload_->temporary_path, upload_->received_size, upload_->modified_seconds};
+    upload_.reset();
+}
+
+void Server::discard_upload() noexcept {
+    if (!upload_) return;
+    upload_->stream.close();
+    std::error_code ignored;
+    fs::remove(upload_->temporary_path, ignored);
     upload_.reset();
 }
 

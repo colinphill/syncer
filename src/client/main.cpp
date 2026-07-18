@@ -31,6 +31,7 @@ struct Options {
     std::vector<std::string> positional;
     bool adopt{};
     bool no_delete{};
+    bool direct{};
     bool dry_run{};
     bool json{};
     bool help{};
@@ -41,7 +42,7 @@ void usage() {
     std::cout << "syncer " << kVersion << "\n\n"
               << "Usage:\n"
               << "  syncer init [--adb PATH] [--serial SERIAL] [--adopt] DEVICE_PATH\n"
-              << "  syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH\n"
+              << "  syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH\n"
               << "  syncer version\n";
 }
 
@@ -76,6 +77,7 @@ Options parse(int argc, wchar_t** argv) {
             ("mtime-tolerance", po::value<std::int64_t>(&options.mtime_tolerance_seconds)->default_value(60),
              "ignore modification-time differences up to this many seconds")
             ("no-delete", po::bool_switch(&options.no_delete), "keep destination-only paths")
+            ("direct", po::bool_switch(&options.direct), "write files without temporary staging")
             ("dry-run", po::bool_switch(&options.dry_run), "calculate without mutating")
             ("json", po::bool_switch(&options.json), "write JSON result to stdout")
             ("path", po::value<std::vector<std::string>>(&options.positional), "source and destination paths");
@@ -199,21 +201,40 @@ int execute(const Options& options) {
         if (options.dry_run) return;
         session.prepare();
         if (plan.files.empty() && plan.directories.empty() && plan.deletions.empty()) return;
-        for (const auto& change : plan.files) {
-            std::cerr << "Staging " << change.entry.path << "\n";
-            session.stage(source.files.at(change.entry.path));
-            transferred_bytes += change.entry.size;
-        }
-        try {
-            const auto current_source = scan_source(source_path, exclusions);
-            if (current_source.manifest != source.manifest)
-                throw Error(ExitCode::source_changed, "source tree changed after it was scanned");
-        } catch (const Error& error) {
-            if (error.code() == ExitCode::source_changed) throw;
-            throw Error(ExitCode::source_changed, "source tree changed after it was scanned: " + std::string(error.what()));
+        const auto verify_source_tree = [&] {
+            try {
+                const auto current_source = scan_source(source_path, exclusions);
+                if (current_source.manifest != source.manifest)
+                    throw Error(ExitCode::source_changed, "source tree changed after it was scanned");
+            } catch (const Error& error) {
+                if (error.code() == ExitCode::source_changed) throw;
+                throw Error(ExitCode::source_changed,
+                            "source tree changed after it was scanned: " + std::string(error.what()));
+            }
+        };
+        if (!options.direct) {
+            for (const auto& change : plan.files) {
+                std::cerr << "Staging " << change.entry.path << "\n";
+                session.upload(source.files.at(change.entry.path), false);
+                transferred_bytes += change.entry.size;
+            }
+            verify_source_tree();
+        } else {
+            // Direct mode starts mutating before all transfers complete, so do the
+            // whole-tree preflight before applying its first planned change.
+            verify_source_tree();
         }
         for (const auto& change : plan.directories) { session.make_directory(change.entry); ++applied_directories; }
-        for (const auto& change : plan.files) { session.commit_file(change.entry.path); ++applied_files; }
+        for (const auto& change : plan.files) {
+            if (options.direct) {
+                std::cerr << "Transferring " << change.entry.path << "\n";
+                session.upload(source.files.at(change.entry.path), true);
+                transferred_bytes += change.entry.size;
+            }
+            if (!options.direct) session.commit_file(change.entry.path);
+            ++applied_files;
+        }
+        if (options.direct) verify_source_tree();
         for (const auto& change : plan.deletions) { session.delete_path(change.entry.path); ++applied_deletions; }
     });
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -223,6 +244,7 @@ int execute(const Options& options) {
         boost::json::object result{
             {"schema", 1}, {"status", status}, {"device", adb.serial()},
             {"source", options.positional[0]}, {"destination", options.positional[1]},
+            {"direct", options.direct},
             {"mtime_tolerance_seconds", options.mtime_tolerance_seconds},
             {"planned", counts(plan.files.size(), plan.directories.size(), plan.deletions.size(), plan.transfer_bytes)},
             {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes)},

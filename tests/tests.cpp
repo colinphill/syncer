@@ -161,6 +161,16 @@ void test_protocol() {
     CHECK(decoded_frame.type == frame.type);
     CHECK(decoded_frame.request_id == 42);
 
+    const std::array<std::uint8_t, 1> direct_placement{1};
+    syncer::ByteReader placement_reader(direct_placement);
+    CHECK(syncer::decode_upload_placement(placement_reader) == syncer::UploadPlacement::direct);
+    placement_reader.require_end();
+    CHECK(throws_syncer_error([] {
+        const std::array<std::uint8_t, 1> invalid_placement{2};
+        syncer::ByteReader invalid_reader(invalid_placement);
+        (void)syncer::decode_upload_placement(invalid_reader);
+    }));
+
     CHECK(throws_syncer_error([] {
         const std::array<std::uint8_t, 3> truncated{0, 0, 0};
         syncer::ByteReader short_reader(truncated);

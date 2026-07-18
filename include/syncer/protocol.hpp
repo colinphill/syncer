@@ -31,6 +31,8 @@ enum class MessageType : std::uint16_t {
     prepare = 18,
 };
 
+enum class UploadPlacement : std::uint8_t { staged = 0, direct = 1 };
+
 struct Frame {
     MessageType type{};
     std::uint32_t request_id{};
@@ -73,5 +75,6 @@ private:
 [[nodiscard]] Frame decode_frame_header(std::span<const std::uint8_t, 16> header);
 void encode_manifest_entry(ByteWriter& writer, const ManifestEntry& entry);
 [[nodiscard]] ManifestEntry decode_manifest_entry(ByteReader& reader);
+[[nodiscard]] UploadPlacement decode_upload_placement(ByteReader& reader);
 
 }

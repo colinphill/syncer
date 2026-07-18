@@ -129,14 +129,16 @@ Manifest ClientSession::scan(std::string_view device_path) {
 
 void ClientSession::prepare() { operation(MessageType::prepare); }
 
-void ClientSession::stage(const SourceFile& source) {
+void ClientSession::upload(const SourceFile& source, bool direct) {
     verify_source(source);
-    ByteWriter begin;
-    begin.string(source.entry.path); begin.u64(source.entry.size); begin.i64(source.entry.modified_seconds);
-    operation(MessageType::put_begin, std::move(begin).take());
-
     std::ifstream input(source.physical_path, std::ios::binary);
     if (!input) throw Error(ExitCode::source_changed, "cannot open source file: " + source.entry.path);
+
+    ByteWriter begin;
+    begin.string(source.entry.path); begin.u64(source.entry.size); begin.i64(source.entry.modified_seconds);
+    begin.u8(static_cast<std::uint8_t>(direct ? UploadPlacement::direct : UploadPlacement::staged));
+    operation(MessageType::put_begin, std::move(begin).take());
+
     Blake3 hash;
     std::vector<std::uint8_t> buffer(kTransferChunkSize);
     std::uint64_t total{};

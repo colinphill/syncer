@@ -29,6 +29,7 @@ private:
         std::uint64_t expected_size{};
         std::uint64_t received_size{};
         std::int64_t modified_seconds{};
+        bool direct{};
     };
     struct StagedFile {
         std::filesystem::path temporary_path;
@@ -53,6 +54,7 @@ private:
     void put_begin(ByteReader& reader);
     void put_chunk(const Frame& frame);
     void put_end(ByteReader& reader);
+    void discard_upload() noexcept;
     void commit_file(ByteReader& reader);
     void delete_path(ByteReader& reader);
     void set_mtime(ByteReader& reader);

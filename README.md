@@ -17,7 +17,8 @@ Boost.Asio provides the synchronous TCP and Android local-socket transports. Boo
 - Excluded paths are neither copied nor deleted.
 - Files are compared by size and whole-second modification time, with a default 60-second tolerance for timestamp noise. Use `--mtime-tolerance SECONDS` to override it; `0` restores exact comparison. A same-size edit within the tolerance is intentionally not detected in v1.
 - File modification times are applied where the shared-storage implementation permits it. A versioned logical timestamp catalog in `.syncer/` preserves comparison semantics when Android rejects timestamp updates from the ADB shell user. Directory modification times are ignored.
-- Changed files are staged and BLAKE3-verified before planned destination changes begin. Replacement is atomic per file, but the complete tree update is not transactional.
+- By default, changed files are staged and BLAKE3-verified before planned destination changes begin. Replacement is atomic per file, but the complete tree update is not transactional.
+- `--direct` streams each changed file straight to its destination without using temporary upload space. Each file is still BLAKE3-verified, but replacement is not atomic: a failed transfer removes the incomplete target, and earlier changes may already have been applied.
 
 ## Build
 
@@ -42,7 +43,7 @@ Pushing a tag matching the CMake project version, such as `v0.1.0`, creates a Wi
 
 ```text
 syncer init [--adb PATH] [--serial SERIAL] [--adopt] DEVICE_PATH
-syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH
+syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH
 syncer version
 ```
 
@@ -51,6 +52,7 @@ syncer init /sdcard/MyMirror
 syncer push --dry-run C:\work\assets /sdcard/MyMirror
 syncer push --exclude "**/*.tmp" C:\work\assets /sdcard/MyMirror
 syncer push --mtime-tolerance 0 C:\work\assets /sdcard/MyMirror
+syncer push --direct C:\Music music
 syncer init music
 syncer push C:\Music music
 ```

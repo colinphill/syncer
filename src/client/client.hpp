@@ -20,7 +20,7 @@ public:
     void initialize(std::string_view device_path, bool adopt);
     [[nodiscard]] Manifest scan(std::string_view device_path);
     void prepare();
-    void stage(const SourceFile& source);
+    void upload(const SourceFile& source, bool direct);
     void make_directory(const ManifestEntry& entry);
     void commit_file(std::string_view path);
     void delete_path(std::string_view path);
