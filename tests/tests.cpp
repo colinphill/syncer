@@ -4,13 +4,15 @@
 #include "syncer/manifest.hpp"
 #include "syncer/protocol.hpp"
 
-#ifdef _WIN32
 #include "scanner.hpp"
+#include "process.hpp"
+#ifdef _WIN32
 #include <windows.h>
 #endif
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -194,13 +196,13 @@ void test_protocol() {
     }));
 }
 
-#ifdef _WIN32
 void test_source_scan() {
-    const auto root = std::filesystem::temp_directory_path() / ("syncer-test-" + std::to_string(GetCurrentProcessId()));
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() / ("syncer-test-" + std::to_string(unique));
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root / "nested");
     { std::ofstream(root / "nested" / "file.txt", std::ios::binary) << "data"; }
-    { std::ofstream(root / L"unicode-\u03b1.txt", std::ios::binary) << "unicode"; }
+    { std::ofstream(root / std::filesystem::path(std::u8string(u8"unicode-\u03b1.txt")), std::ios::binary) << "unicode"; }
     { std::ofstream(root / "ignored.tmp", std::ios::binary) << "ignored"; }
     const auto tree = syncer::client::scan_source(root, syncer::GlobSet({"**/*.tmp"}));
     CHECK(tree.manifest.contains("nested"));
@@ -210,7 +212,35 @@ void test_source_scan() {
     CHECK(!tree.manifest.contains("ignored.tmp"));
     std::filesystem::create_directory(root / ".syncer");
     CHECK(throws_syncer_error([&] { (void)syncer::client::scan_source(root, syncer::GlobSet{}); }));
+    std::filesystem::remove_all(root / ".syncer");
+#ifndef _WIN32
+    std::error_code error;
+    std::filesystem::create_symlink(root / "nested" / "file.txt", root / "linked.txt", error);
+    CHECK(!error);
+    if (!error) {
+        const auto linked = syncer::client::scan_source(root, syncer::GlobSet{});
+        CHECK(linked.manifest.contains("linked.txt"));
+        CHECK(linked.manifest.at("linked.txt").size == 4);
+        std::filesystem::remove(root / "linked.txt");
+    }
+    std::filesystem::create_directory_symlink(root, root / "nested" / "loop", error);
+    CHECK(!error);
+    if (!error) CHECK(throws_syncer_error([&] { (void)syncer::client::scan_source(root, syncer::GlobSet{}); }));
+#endif
     std::filesystem::remove_all(root);
+}
+
+#ifndef _WIN32
+void test_processes() {
+    const auto result = syncer::client::run_process("/bin/sh", {"-c", "printf stdout; printf stderr >&2; exit 7"});
+    CHECK(result.exit_code == 7);
+    CHECK(result.output == "stdoutstderr");
+
+    auto child = syncer::client::start_process("/bin/sh", {"-c", "printf child-output"});
+    CHECK(child.valid());
+    child.finish(1000);
+    CHECK(!child.valid());
+    CHECK(child.output() == "child-output");
 }
 #endif
 }
@@ -218,8 +248,9 @@ void test_source_scan() {
 int main() {
     try {
         test_blake3(); test_globs(); test_paths_and_plan(); test_protocol();
-#ifdef _WIN32
         test_source_scan();
+#ifndef _WIN32
+        test_processes();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "unexpected exception: " << error.what() << '\n'; return 1;

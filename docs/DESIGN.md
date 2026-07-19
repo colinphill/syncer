@@ -4,7 +4,7 @@
 
 For each `init` or `push`, the client resolves one ready ADB device, queries its ABI, deploys the matching `syncerd`, and creates an ADB forward from an allocated localhost TCP port to a random Android abstract Unix socket. Deployments are content-addressed with BLAKE3, allowing an unchanged server binary already on the device to be reused. The server receives a random 256-bit token on its fixed-safe command line and requires it in the first framed message. It accepts one connection and applies a 30-second socket idle timeout.
 
-Boost.Asio owns the Windows TCP socket and Android local stream acceptor/socket. The framing functions are templates over Asio synchronous stream concepts, keeping the binary protocol transport-independent. User-controlled destination paths never appear in an Android shell command; they travel in bounded frames and are validated server-side.
+Boost.Asio owns the host TCP socket and Android local stream acceptor/socket. The framing functions are templates over Asio synchronous stream concepts, keeping the binary protocol transport-independent. User-controlled destination paths never appear in an Android shell command; they travel in bounded frames and are validated server-side.
 
 ## Wire protocol
 
@@ -24,7 +24,7 @@ The default sequence is handshake, initialize or scan, mutation preparation, sta
 
 ## Filesystem transaction
 
-Source scanning finishes before device mutation. Links and Windows junctions are followed at their logical link paths. Canonical directory identities on the active recursion ancestry detect cycles while allowing one external tree at multiple logical paths.
+Source scanning finishes before device mutation. Symbolic links and Windows junctions are followed at their logical link paths. Canonical directory identities on Windows and device/inode identities on macOS and Linux detect cycles on the active recursion ancestry while allowing one external tree at multiple logical paths.
 
 The Android scan never follows destination links. It enumerates independent directories with up to four bounded workers, while a single thread serializes manifest batches to the client. By default, uploads are staged under `.syncer/tmp`; only after all changed files stage successfully does the client create required directories, commit files, and delete extras deepest-first. With `--direct`, the client preflights the source tree, creates required directories, and streams changed files directly to their final paths without consuming upload staging space. A direct transfer removes the old target before writing and removes an incomplete target on failure, so replacement is not atomic and earlier operations can remain applied.
 
@@ -35,7 +35,7 @@ The server attempts to apply source file modification times directly. When an An
 ## Release layout
 
 ```text
-syncer.exe
+syncer (or syncer.exe on Windows)
 servers/
   arm64-v8a/syncerd
   armeabi-v7a/syncerd

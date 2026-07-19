@@ -1,6 +1,6 @@
 #pragma once
 
-#include "process_windows.hpp"
+#include "process.hpp"
 
 #include <filesystem>
 #include <optional>
@@ -17,7 +17,7 @@ public:
     [[nodiscard]] ChildProcess launch_server(std::string_view remote_path, std::string_view socket_name,
                                              std::string_view token);
 private:
-    [[nodiscard]] ProcessResult run(const std::vector<std::wstring>& arguments, bool device = true) const;
+    [[nodiscard]] ProcessResult run(const std::vector<std::string>& arguments, bool device = true) const;
     [[nodiscard]] std::string query_abi() const;
     [[nodiscard]] static std::filesystem::path locate(const std::optional<std::filesystem::path>& requested);
     [[nodiscard]] std::string select_serial(const std::optional<std::string>& requested) const;

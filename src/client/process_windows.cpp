@@ -1,7 +1,6 @@
-#include "process_windows.hpp"
+#include "process.hpp"
 
 #include <array>
-#include <cwctype>
 #include <iostream>
 #include <utility>
 
@@ -9,9 +8,39 @@ namespace syncer::client {
 namespace fs = std::filesystem;
 namespace {
 
-std::wstring command_line(const fs::path& executable, const std::vector<std::wstring>& arguments) {
+std::wstring widen(std::string_view value) {
+    if (value.empty()) return {};
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                           static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) throw Error(ExitCode::usage, "invalid UTF-8 text");
+    std::wstring result(static_cast<std::size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+                        result.data(), length);
+    return result;
+}
+
+std::wstring quote_argument(std::wstring_view value) {
+    if (!value.empty() && value.find_first_of(L" \t\n\v\"") == value.npos) return std::wstring(value);
+    std::wstring output(1, L'\"');
+    std::size_t backslashes = 0;
+    for (const auto character : value) {
+        if (character == L'\\') { ++backslashes; continue; }
+        if (character == L'\"') output.append(backslashes * 2 + 1, L'\\');
+        else output.append(backslashes, L'\\');
+        backslashes = 0;
+        output.push_back(character);
+    }
+    output.append(backslashes * 2, L'\\');
+    output.push_back(L'\"');
+    return output;
+}
+
+std::wstring command_line(const fs::path& executable, const std::vector<std::string>& arguments) {
     std::wstring result = quote_argument(executable.wstring());
-    for (const auto& argument : arguments) { result.push_back(L' '); result += quote_argument(argument); }
+    for (const auto& argument : arguments) {
+        result.push_back(L' ');
+        result += quote_argument(widen(argument));
+    }
     return result;
 }
 
@@ -42,44 +71,35 @@ Utf8ConsoleOutput::~Utf8ConsoleOutput() noexcept {
     SetConsoleOutputCP(original_code_page_);
 }
 
-std::wstring widen(std::string_view value) {
+std::string utf8_from_wide(std::wstring_view value) {
     if (value.empty()) return {};
-    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
-    if (length <= 0) throw Error(ExitCode::usage, "invalid UTF-8 text");
-    std::wstring result(static_cast<std::size_t>(length), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), length);
-    return result;
-}
-
-std::string narrow(std::wstring_view value) {
-    if (value.empty()) return {};
-    const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                                           static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
     if (length <= 0) throw Error(ExitCode::usage, "invalid Windows Unicode text");
     std::string result(static_cast<std::size_t>(length), '\0');
-    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), length, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+                        result.data(), length, nullptr, nullptr);
     return result;
 }
 
-std::wstring quote_argument(std::wstring_view value) {
-    if (!value.empty() && value.find_first_of(L" \t\n\v\"") == value.npos) return std::wstring(value);
-    std::wstring output(1, L'\"');
-    std::size_t backslashes = 0;
-    for (const auto character : value) {
-        if (character == L'\\') { ++backslashes; continue; }
-        if (character == L'\"') output.append(backslashes * 2 + 1, L'\\');
-        else output.append(backslashes, L'\\');
-        backslashes = 0;
-        output.push_back(character);
-    }
-    output.append(backslashes * 2, L'\\');
-    output.push_back(L'\"');
-    return output;
+fs::path path_from_utf8(std::string_view value) { return fs::path(widen(value)); }
+
+std::string path_to_utf8(const fs::path& value) { return utf8_from_wide(value.wstring()); }
+
+fs::path executable_directory() {
+    std::wstring buffer(32768, L'\0');
+    const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length == buffer.size())
+        throw Error(ExitCode::adb, "cannot determine client installation directory");
+    buffer.resize(length);
+    return fs::path(buffer).parent_path();
 }
 
-ProcessResult run_process(const fs::path& executable, const std::vector<std::wstring>& arguments) {
+ProcessResult run_process(const fs::path& executable, const std::vector<std::string>& arguments) {
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     HANDLE read_pipe{}, write_pipe{};
-    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) throw Error(ExitCode::adb, windows_error("cannot create process pipe"));
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0))
+        throw Error(ExitCode::adb, windows_error("cannot create process pipe"));
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOW startup{sizeof(startup)};
     startup.dwFlags = STARTF_USESTDHANDLES;
@@ -91,7 +111,10 @@ ProcessResult run_process(const fs::path& executable, const std::vector<std::wst
     const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
                                         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info);
     CloseHandle(write_pipe);
-    if (!created) { CloseHandle(read_pipe); throw Error(ExitCode::adb, windows_error("cannot start process")); }
+    if (!created) {
+        CloseHandle(read_pipe);
+        throw Error(ExitCode::adb, windows_error("cannot start process"));
+    }
     CloseHandle(info.hThread);
     std::string output;
     std::array<char, 4096> buffer{};
@@ -106,14 +129,15 @@ ProcessResult run_process(const fs::path& executable, const std::vector<std::wst
     return ProcessResult{static_cast<int>(exit_code), std::move(output)};
 }
 
-ChildProcess start_process(const fs::path& executable, const std::vector<std::wstring>& arguments) {
+ChildProcess start_process(const fs::path& executable, const std::vector<std::string>& arguments) {
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     HANDLE read_pipe{}, write_pipe{};
     if (!CreatePipe(&read_pipe, &write_pipe, &security, 0))
         throw Error(ExitCode::adb, windows_error("cannot create Android server output pipe"));
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-    HANDLE null_handle = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                     &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE null_handle = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr);
     if (null_handle == INVALID_HANDLE_VALUE) {
         CloseHandle(read_pipe);
         CloseHandle(write_pipe);
@@ -121,7 +145,9 @@ ChildProcess start_process(const fs::path& executable, const std::vector<std::ws
     }
     STARTUPINFOW startup{sizeof(startup)};
     startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = null_handle; startup.hStdOutput = write_pipe; startup.hStdError = write_pipe;
+    startup.hStdInput = null_handle;
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = write_pipe;
     PROCESS_INFORMATION info{};
     auto command = command_line(executable, arguments);
     const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
@@ -140,6 +166,7 @@ ChildProcess::ChildProcess(ChildProcess&& other) noexcept
     : process_(std::exchange(other.process_, nullptr)),
       output_handle_(std::exchange(other.output_handle_, nullptr)),
       output_(std::move(other.output_)) {}
+
 ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
     if (this != &other) {
         finish();
@@ -149,7 +176,9 @@ ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
     }
     return *this;
 }
+
 ChildProcess::~ChildProcess() { finish(); }
+
 void ChildProcess::finish(unsigned timeout_ms) noexcept {
     if (process_) {
         if (WaitForSingleObject(process_, timeout_ms) == WAIT_TIMEOUT) {

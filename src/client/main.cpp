@@ -1,6 +1,6 @@
 #include "adb.hpp"
 #include "client.hpp"
-#include "process_windows.hpp"
+#include "process.hpp"
 #include "scanner.hpp"
 
 #include "syncer/error.hpp"
@@ -46,12 +46,11 @@ void usage() {
               << "  syncer version\n";
 }
 
-Options parse(int argc, wchar_t** argv) {
-    if (argc < 2) throw Error(ExitCode::usage, "missing command; use init, push, or version");
+Options parse(const std::vector<std::string>& command_line) {
+    if (command_line.size() < 2) throw Error(ExitCode::usage, "missing command; use init, push, or version");
     Options options;
-    options.command = narrow(argv[1]);
-    std::vector<std::string> arguments;
-    for (int i = 2; i < argc; ++i) arguments.push_back(narrow(argv[i]));
+    options.command = command_line[1];
+    std::vector<std::string> arguments(command_line.begin() + 2, command_line.end());
     if (options.command == "version") {
         if (!arguments.empty()) throw Error(ExitCode::usage, "version takes no arguments");
         return options;
@@ -63,7 +62,7 @@ Options parse(int argc, wchar_t** argv) {
     po::options_description description("Options");
     description.add_options()
         ("help,h", po::bool_switch(&options.help), "show help")
-        ("adb", po::value<std::string>(&adb_path), "path to adb.exe")
+        ("adb", po::value<std::string>(&adb_path), "path to adb")
         ("serial", po::value<std::string>(&serial), "ADB device serial");
     po::positional_options_description positional;
     if (options.command == "init") {
@@ -92,7 +91,7 @@ Options parse(int argc, wchar_t** argv) {
     }
     if (options.mtime_tolerance_seconds < 0)
         throw Error(ExitCode::usage, "--mtime-tolerance cannot be negative");
-    if (!adb_path.empty()) options.adb = std::filesystem::path(widen(adb_path));
+    if (!adb_path.empty()) options.adb = path_from_utf8(adb_path);
     if (!serial.empty()) options.serial = serial;
     return options;
 }
@@ -184,7 +183,7 @@ int execute(const Options& options) {
     if (options.positional.size() != 2) throw Error(ExitCode::usage, "push requires LOCAL_SOURCE and DEVICE_PATH");
     const auto started = std::chrono::steady_clock::now();
     const GlobSet exclusions(options.excludes);
-    const auto source_path = std::filesystem::path(widen(options.positional[0]));
+    const auto source_path = path_from_utf8(options.positional[0]);
     std::cerr << "Scanning source...\n";
     auto source_scan = std::async(std::launch::async, [&] { return scan_source(source_path, exclusions); });
     Adb adb(options.adb, options.serial);
@@ -268,24 +267,47 @@ std::string error_json(int code, std::string_view message) {
     return boost::json::serialize(result);
 }
 
-} // namespace syncer::client
-
-int wmain(int argc, wchar_t** argv) {
-    const syncer::client::Utf8ConsoleOutput console_output;
-    bool json = false;
-    for (int i = 1; i < argc; ++i) if (std::wstring_view(argv[i]) == L"--json") json = true;
+int run(std::vector<std::string> command_line) {
+    const bool json = std::find(command_line.begin() + std::min<std::size_t>(1, command_line.size()),
+                                command_line.end(), "--json") != command_line.end();
     try {
-        if (argc == 2 && (std::wstring_view(argv[1]) == L"--help" || std::wstring_view(argv[1]) == L"-h")) {
-            syncer::client::usage(); return 0;
+        if (command_line.size() == 2 && (command_line[1] == "--help" || command_line[1] == "-h")) {
+            usage(); return 0;
         }
-        return syncer::client::execute(syncer::client::parse(argc, argv));
-    } catch (const syncer::Error& error) {
-        if (json) std::cout << syncer::client::error_json(static_cast<int>(error.code()), error.what()) << '\n';
+        return execute(parse(command_line));
+    } catch (const Error& error) {
+        if (json) std::cout << error_json(static_cast<int>(error.code()), error.what()) << '\n';
         else std::cerr << "syncer: " << error.what() << '\n';
         return static_cast<int>(error.code());
     } catch (const std::exception& error) {
-        if (json) std::cout << syncer::client::error_json(static_cast<int>(syncer::ExitCode::transfer), error.what()) << '\n';
+        if (json) std::cout << error_json(static_cast<int>(ExitCode::transfer), error.what()) << '\n';
         else std::cerr << "syncer: " << error.what() << '\n';
-        return static_cast<int>(syncer::ExitCode::transfer);
+        return static_cast<int>(ExitCode::transfer);
     }
 }
+
+} // namespace syncer::client
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    const syncer::client::Utf8ConsoleOutput console_output;
+    try {
+        std::vector<std::string> command_line;
+        command_line.reserve(static_cast<std::size_t>(argc));
+        for (int index = 0; index < argc; ++index)
+            command_line.push_back(syncer::client::utf8_from_wide(argv[index]));
+        return syncer::client::run(std::move(command_line));
+    } catch (const syncer::Error& error) {
+        std::cerr << "syncer: " << error.what() << '\n';
+        return static_cast<int>(error.code());
+    }
+}
+#else
+int main(int argc, char** argv) {
+    const syncer::client::Utf8ConsoleOutput console_output;
+    std::vector<std::string> command_line;
+    command_line.reserve(static_cast<std::size_t>(argc));
+    for (int index = 0; index < argc; ++index) command_line.emplace_back(argv[index]);
+    return syncer::client::run(std::move(command_line));
+}
+#endif

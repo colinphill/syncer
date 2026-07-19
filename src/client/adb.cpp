@@ -11,6 +11,10 @@
 #include <set>
 #include <sstream>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace syncer::client {
 namespace fs = std::filesystem;
 namespace {
@@ -42,14 +46,6 @@ std::vector<std::string> split(std::string_view value, char delimiter) {
     return result;
 }
 
-fs::path executable_directory() {
-    std::wstring buffer(32768, L'\0');
-    const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length == buffer.size()) throw Error(ExitCode::adb, "cannot determine client installation directory");
-    buffer.resize(length);
-    return fs::path(buffer).parent_path();
-}
-
 std::string file_digest(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw Error(ExitCode::adb, "cannot read packaged Android server");
@@ -78,23 +74,46 @@ fs::path Adb::locate(const std::optional<fs::path>& requested) {
     }
     for (const char* variable : {"ANDROID_HOME", "ANDROID_SDK_ROOT"}) {
         if (const char* value = std::getenv(variable); value && *value) {
-            const fs::path candidate = fs::path(value) / "platform-tools" / "adb.exe";
+            const fs::path candidate = path_from_utf8(value) / "platform-tools" /
+#ifdef _WIN32
+                "adb.exe";
+#else
+                "adb";
+#endif
             if (fs::is_regular_file(candidate)) return candidate;
         }
     }
+#ifdef _WIN32
     if (const char* local_app_data = std::getenv("LOCALAPPDATA"); local_app_data && *local_app_data) {
-        const fs::path candidate = fs::path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe";
+        const fs::path candidate = path_from_utf8(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe";
         if (fs::is_regular_file(candidate)) return candidate;
     }
     std::wstring found(32768, L'\0');
     const auto length = SearchPathW(nullptr, L"adb.exe", nullptr, static_cast<DWORD>(found.size()), found.data(), nullptr);
     if (length > 0 && length < found.size()) { found.resize(length); return found; }
-    throw Error(ExitCode::adb, "adb.exe was not found; use --adb or install Android platform-tools");
+#else
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        const fs::path candidate = path_from_utf8(home) /
+#if defined(__APPLE__)
+            "Library" / "Android" / "sdk" / "platform-tools" / "adb";
+#else
+            "Android" / "Sdk" / "platform-tools" / "adb";
+#endif
+        if (fs::is_regular_file(candidate)) return candidate;
+    }
+    if (const char* path = std::getenv("PATH"); path && *path) {
+        for (const auto& directory : split(path, ':')) {
+            const fs::path candidate = (directory.empty() ? fs::current_path() : path_from_utf8(directory)) / "adb";
+            if (fs::is_regular_file(candidate)) return fs::canonical(candidate);
+        }
+    }
+#endif
+    throw Error(ExitCode::adb, "adb was not found; use --adb or install Android platform-tools");
 }
 
-ProcessResult Adb::run(const std::vector<std::wstring>& arguments, bool device) const {
-    std::vector<std::wstring> complete;
-    if (device) { complete.emplace_back(L"-s"); complete.push_back(widen(serial_)); }
+ProcessResult Adb::run(const std::vector<std::string>& arguments, bool device) const {
+    std::vector<std::string> complete;
+    if (device) { complete.emplace_back("-s"); complete.push_back(serial_); }
     complete.insert(complete.end(), arguments.begin(), arguments.end());
     return run_process(executable_, complete);
 }
@@ -103,11 +122,11 @@ std::string Adb::select_serial(const std::optional<std::string>& requested) cons
     std::optional<std::string> desired = requested;
     if (!desired) if (const char* value = std::getenv("ANDROID_SERIAL"); value && *value) desired = value;
     if (desired) {
-        const auto result = run_process(executable_, {L"-s", widen(*desired), L"get-state"});
+        const auto result = run_process(executable_, {"-s", *desired, "get-state"});
         if (result.exit_code != 0 || last_line(result.output) != "device") throw Error(ExitCode::adb, "selected ADB device is not ready: " + *desired);
         return *desired;
     }
-    const auto result = run_process(executable_, {L"devices"});
+    const auto result = run_process(executable_, {"devices"});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "adb devices failed: " + trim(result.output));
     std::vector<std::string> devices;
     std::istringstream lines(result.output);
@@ -122,8 +141,8 @@ std::string Adb::select_serial(const std::optional<std::string>& requested) cons
 }
 
 std::string Adb::query_abi() const {
-    auto result = run({L"shell", L"getprop", L"ro.product.cpu.abilist"});
-    if (result.exit_code != 0 || last_line(result.output).empty()) result = run({L"shell", L"getprop", L"ro.product.cpu.abi"});
+    auto result = run({"shell", "getprop", "ro.product.cpu.abilist"});
+    if (result.exit_code != 0 || last_line(result.output).empty()) result = run({"shell", "getprop", "ro.product.cpu.abi"});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot query Android CPU ABI");
     static const std::set<std::string> supported{"arm64-v8a", "armeabi-v7a", "x86_64", "x86"};
     for (auto abi : split(last_line(result.output), ',')) if (supported.contains(abi)) return abi;
@@ -132,36 +151,36 @@ std::string Adb::query_abi() const {
 
 std::string Adb::deploy_server() {
     const auto abi = query_abi();
-    const auto local = executable_directory() / "servers" / widen(abi) / "syncerd";
-    if (!fs::is_regular_file(local)) throw Error(ExitCode::adb, "packaged Android server is missing: " + narrow(local.wstring()));
+    const auto local = executable_directory() / "servers" / abi / "syncerd";
+    if (!fs::is_regular_file(local)) throw Error(ExitCode::adb, "packaged Android server is missing: " + path_to_utf8(local));
     const auto digest = file_digest(local);
     const std::string directory = std::string("/data/local/tmp/syncer/") + kVersion + "/" + digest;
     const std::string remote = directory + "/syncerd";
-    auto result = run({L"shell", L"test", L"-x", widen(remote)});
+    auto result = run({"shell", "test", "-x", remote});
     if (result.exit_code == 0) return remote;
-    result = run({L"shell", L"mkdir", L"-p", widen(directory)});
+    result = run({"shell", "mkdir", "-p", directory});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot create Android deployment directory: " + trim(result.output));
-    result = run({L"push", local.wstring(), widen(remote)});
+    result = run({"push", path_to_utf8(local), remote});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot deploy Android server: " + trim(result.output));
-    result = run({L"shell", L"chmod", L"755", widen(remote)});
+    result = run({"shell", "chmod", "755", remote});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot make Android server executable: " + trim(result.output));
     return remote;
 }
 
 unsigned Adb::create_forward(std::string_view socket_name) {
-    const auto result = run({L"forward", L"tcp:0", widen(std::string("localabstract:") + std::string(socket_name))});
+    const auto result = run({"forward", "tcp:0", std::string("localabstract:") + std::string(socket_name)});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "cannot create ADB forwarding: " + trim(result.output));
     try { return static_cast<unsigned>(std::stoul(last_line(result.output))); }
     catch (...) { throw Error(ExitCode::adb, "ADB returned an invalid forwarded port: " + last_line(result.output)); }
 }
 
 void Adb::remove_forward(unsigned port) noexcept {
-    try { (void)run({L"forward", L"--remove", L"tcp:" + std::to_wstring(port)}); } catch (...) {}
+    try { (void)run({"forward", "--remove", "tcp:" + std::to_string(port)}); } catch (...) {}
 }
 
 ChildProcess Adb::launch_server(std::string_view remote_path, std::string_view socket_name, std::string_view token) {
-    return start_process(executable_, {L"-s", widen(serial_), L"shell", widen(remote_path), L"--socket",
-                                       widen(socket_name), L"--token", widen(token)});
+    return start_process(executable_, {"-s", serial_, "shell", std::string(remote_path), "--socket",
+                                       std::string(socket_name), "--token", std::string(token)});
 }
 
 } // namespace syncer::client

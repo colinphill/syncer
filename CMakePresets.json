@@ -10,6 +10,25 @@
       "binaryDir": "${sourceDir}/out/build/windows"
     },
     {
+      "name": "host-posix-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux",
+      "inherits": "host-posix-base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS",
+      "inherits": "host-posix-base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
       "name": "android-base",
       "hidden": true,
       "generator": "Ninja",
@@ -29,6 +48,8 @@
   ],
   "buildPresets": [
     { "name": "windows", "configurePreset": "windows", "configuration": "Release" },
+    { "name": "linux", "configurePreset": "linux" },
+    { "name": "macos", "configurePreset": "macos" },
     { "name": "arm64-v8a", "configurePreset": "arm64-v8a" },
     { "name": "armeabi-v7a", "configurePreset": "armeabi-v7a" },
     { "name": "x86_64", "configurePreset": "x86_64" },
