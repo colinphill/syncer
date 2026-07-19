@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cwctype>
+#include <iostream>
 #include <utility>
 
 namespace syncer::client {
@@ -19,6 +20,27 @@ std::string windows_error(std::string_view operation) {
 }
 
 } // namespace
+
+Utf8ConsoleOutput::Utf8ConsoleOutput() noexcept {
+    DWORD mode{};
+    const auto is_console = [&](DWORD standard_handle) {
+        const HANDLE handle = GetStdHandle(standard_handle);
+        return handle != nullptr && handle != INVALID_HANDLE_VALUE && GetConsoleMode(handle, &mode);
+    };
+    if (!is_console(STD_OUTPUT_HANDLE) && !is_console(STD_ERROR_HANDLE)) return;
+    original_code_page_ = GetConsoleOutputCP();
+    if (original_code_page_ != 0 && original_code_page_ != CP_UTF8)
+        changed_ = SetConsoleOutputCP(CP_UTF8) != FALSE;
+}
+
+Utf8ConsoleOutput::~Utf8ConsoleOutput() noexcept {
+    if (!changed_) return;
+    try {
+        std::cout.flush();
+        std::cerr.flush();
+    } catch (...) {}
+    SetConsoleOutputCP(original_code_page_);
+}
 
 std::wstring widen(std::string_view value) {
     if (value.empty()) return {};

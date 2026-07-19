@@ -271,6 +271,7 @@ std::string error_json(int code, std::string_view message) {
 } // namespace syncer::client
 
 int wmain(int argc, wchar_t** argv) {
+    const syncer::client::Utf8ConsoleOutput console_output;
     bool json = false;
     for (int i = 1; i < argc; ++i) if (std::wstring_view(argv[i]) == L"--json") json = true;
     try {

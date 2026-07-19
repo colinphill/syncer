@@ -34,6 +34,17 @@ private:
     std::string output_;
 };
 
+class Utf8ConsoleOutput {
+public:
+    Utf8ConsoleOutput() noexcept;
+    Utf8ConsoleOutput(const Utf8ConsoleOutput&) = delete;
+    Utf8ConsoleOutput& operator=(const Utf8ConsoleOutput&) = delete;
+    ~Utf8ConsoleOutput() noexcept;
+private:
+    UINT original_code_page_{};
+    bool changed_{};
+};
+
 [[nodiscard]] ProcessResult run_process(const std::filesystem::path& executable,
                                         const std::vector<std::wstring>& arguments);
 [[nodiscard]] ChildProcess start_process(const std::filesystem::path& executable,
