@@ -118,11 +118,42 @@ public sealed class CoreTests
     }
 
     [TestMethod]
+    public void SourceScannerLeavesWindowsUncReparsePointsInTheNetworkNamespace()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        Assert.IsFalse(SourceScanner.ShouldResolveReparsePoint(@"\\server\share\folder"));
+        Assert.IsFalse(SourceScanner.ShouldResolveReparsePoint(@"\\?\UNC\server\share\folder"));
+        Assert.IsFalse(SourceScanner.ShouldResolveReparsePoint(@"\\server\share\folder\link"));
+        Assert.IsTrue(SourceScanner.ShouldResolveReparsePoint(@"C:\source-link"));
+    }
+
+    [TestMethod]
     public async Task SourceScannerRejectsReservedStateDirectory()
     {
         var root = Path.Combine(Path.GetTempPath(), "syncer-reserved-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(Path.Combine(root, ".syncer"));
         try { var error = await Assert.ThrowsExactlyAsync<SyncerException>(() => SourceScanner.ScanAsync(root, new GlobSet([]), default)); Assert.AreEqual(SyncerErrorCode.Safety, error.ErrorCode); }
         finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task ChangeProgressReportsTerminalCompletionAndFailure()
+    {
+        var change = new PlannedChange(new("file.flac", EntryType.File, 10, 1),
+            PlanAction.AddFile, "missing");
+        var completed = new RecordingProgress<SyncerProgress>();
+        await SyncerClient.RunChangeAsync(change, SyncerProgressStage.Applying, true,
+            completed, () => Task.CompletedTask);
+        CollectionAssert.AreEqual(
+            new[] { SyncerProgressStage.Applying, SyncerProgressStage.CompletedChange },
+            completed.Values.Select(value => value.Stage).ToArray());
+
+        var failed = new RecordingProgress<SyncerProgress>();
+        await Assert.ThrowsExactlyAsync<IOException>(() => SyncerClient.RunChangeAsync(
+            change, SyncerProgressStage.Applying, true, failed,
+            () => Task.FromException(new IOException("failed"))));
+        CollectionAssert.AreEqual(
+            new[] { SyncerProgressStage.Applying, SyncerProgressStage.FailedChange },
+            failed.Values.Select(value => value.Stage).ToArray());
     }
 
     [TestMethod]
@@ -219,4 +250,10 @@ public sealed class CoreTests
     private static string Vector(string name) => File.ReadLines(Path.Combine(AppContext.BaseDirectory, "protocol-v6-vectors.txt"))
         .Where(line => !line.StartsWith('#') && line.Contains('='))
         .Select(line => line.Split('=', 2)).Single(parts => parts[0] == name)[1];
+
+    private sealed class RecordingProgress<T> : IProgress<T>
+    {
+        public List<T> Values { get; } = [];
+        public void Report(T value) => Values.Add(value);
+    }
 }

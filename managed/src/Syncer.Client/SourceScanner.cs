@@ -35,7 +35,8 @@ internal static class SourceScanner
             FileSystemInfo effective = input;
             try
             {
-                if ((input.Attributes & FileAttributes.ReparsePoint) != 0)
+                if ((input.Attributes & FileAttributes.ReparsePoint) != 0 &&
+                    ShouldResolveReparsePoint(input.FullName))
                     effective = input.ResolveLinkTarget(true) ?? throw new IOException();
                 effective.Refresh();
             }
@@ -70,4 +71,16 @@ internal static class SourceScanner
         Walk(new DirectoryInfo(root), string.Empty, true);
         return new SourceTree(manifest, files);
     }
+
+    // Windows exposes DFS/SMB namespace entries as reparse points. ResolveLinkTarget can turn
+    // those UNC paths into malformed application-relative "UNC\server\share" paths; enumerating
+    // the original DirectoryInfo lets Windows follow the network namespace correctly.
+    internal static bool ShouldResolveReparsePoint(string fullName) =>
+        !(OperatingSystem.IsWindows() && IsUncPath(fullName));
+
+    private static bool IsUncPath(string path) =>
+        path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith(@"\\", StringComparison.Ordinal) &&
+        !path.StartsWith(@"\\?\", StringComparison.Ordinal) &&
+        !path.StartsWith(@"\\.\", StringComparison.Ordinal);
 }

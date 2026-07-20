@@ -16,7 +16,8 @@ Boost.Asio provides the synchronous TCP and Android local-socket transports. Boo
 - `init` accepts a new or empty folder. Initializing an existing non-empty folder requires `--adopt`.
 - Push quarantines destination-only and replaced entries under `.syncer/recovery/<run-id>` by
   default. Use `--dry-run` to inspect the plan, `--no-delete` to retain destination-only entries,
-  or `--max-removals COUNT` to enforce a removal ceiling.
+  or `--max-removals COUNT` to enforce a removal ceiling. Omitting `--max-removals` means no
+  maximum; `--max-removals 0` forbids every planned removal.
 - Protocol-6 recovery journals record installed as well as quarantined paths. `restore` removes
   the installed side, reinstates quarantined originals, and preserves displaced current content.
 - `.syncer/` is reserved for destination identity, locking, and temporary uploads.
@@ -24,7 +25,7 @@ Boost.Asio provides the synchronous TCP and Android local-socket transports. Boo
 - Files are compared by size and whole-second modification time, with a default 60-second tolerance for timestamp noise. Use `--mtime-tolerance SECONDS` to override it; `0` restores exact comparison. A same-size edit within the tolerance is intentionally not detected in v1.
 - File modification times are applied where the shared-storage implementation permits it. A versioned logical timestamp catalog in `.syncer/` preserves comparison semantics when Android rejects timestamp updates from the ADB shell user. Directory modification times are ignored.
 - By default, changed files are staged and BLAKE3-verified before planned destination changes begin. Replacement is atomic per file, but the complete tree update is not transactional.
-- `--direct` streams each changed file straight to its destination without using temporary upload space. Each file is still BLAKE3-verified, but replacement is not atomic: a failed transfer removes the incomplete target, and earlier changes may already have been applied.
+- `--direct` streams each changed file straight to its destination without using temporary upload space. It creates no recovery run, journal, or quarantined copies, so replacements and deletions are permanent and cannot be restored. Each file is still BLAKE3-verified, but replacement is not atomic: a failed transfer removes the incomplete target, and earlier changes may already have been applied.
 
 ## Build
 
@@ -76,7 +77,10 @@ The packaging scripts build `syncerd` for `arm64-v8a`, `armeabi-v7a`, `x86_64`, 
 
 GitHub Actions builds and tests the Windows, macOS, and Linux clients plus all four Android server ABIs for pushes and pull requests targeting `main`. The workflow uses Android NDK `27.3.13750724`, matching the supported local toolchain.
 
-Pushing a tag matching the CMake project version, such as `v0.1.0`, creates a Windows x64 release ZIP and publishes it as a GitHub release with generated notes. The Release workflow can also be run manually to produce a downloadable workflow artifact without publishing a GitHub release.
+Pushing a tag matching both the CMake and managed project version, such as `v0.2.0`, creates a
+Windows x64 release ZIP plus `Syncer.Client` and `Syncer.Tool` NuGet packages. The workflow
+publishes those assets and their SHA-256 files in a GitHub release with generated notes. It can
+also be run manually to produce a downloadable workflow artifact without publishing a release.
 
 ## Usage
 
@@ -104,8 +108,9 @@ syncer push C:\Music music
 device, and affected destination-path preconditions. `syncer apply --plan` executes that artifact
 without rescanning either complete tree; it validates the saved digest, the device identity, every
 source file being transferred, and the affected destination paths before mutation. `--expect-plan`
-remains available for callers that prefer a fresh full rescan. Successful mutations return the
-recovery run identifier. `--max-removals` counts destination-only entries and entries removed by a
+remains available for callers that prefer a fresh full rescan. Successful staged mutations return
+the recovery run identifier; direct mutations return no recovery identifier. `--max-removals`
+counts destination-only entries and entries removed by a
 type replacement; ordinary file updates do not consume the ceiling.
 
 `syncer restore` accepts a recovery identifier returned by a successful protocol-6 mutation.

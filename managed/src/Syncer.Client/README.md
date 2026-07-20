@@ -11,3 +11,7 @@ var result = await client.PushAsync("assets", "/sdcard/MyMirror");
 
 The package embeds the matching Android server for all supported ABIs. Set
 `SyncerClientOptions.ServerDirectory` to override those packaged binaries.
+
+`PushOptions.MaximumRemovals = null` allows any number of removals, while `0` allows none.
+`PushOptions.Direct = true` writes without staging and creates no recovery journal or quarantined
+copies; replacements and deletions are permanent, and `SyncResult.RecoveryId` is `null`.

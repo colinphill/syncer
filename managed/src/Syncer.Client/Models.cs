@@ -136,6 +136,8 @@ public enum SyncerProgressStage
     StagingFile,
     TransferringFile,
     Applying,
+    CompletedChange,
+    FailedChange,
 }
 
 public sealed record SyncerProgress(

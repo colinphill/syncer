@@ -25,6 +25,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
       - name: Select Android NDK
         shell: pwsh
         run: |
@@ -51,6 +56,10 @@ jobs:
           $match = Select-String -Path CMakeLists.txt -Pattern '^project\(syncer VERSION ([0-9]+\.[0-9]+\.[0-9]+) '
           if (-not $match) { throw 'Could not read the project version from CMakeLists.txt.' }
           $version = $match.Matches[0].Groups[1].Value
+          $managedMatch = Select-String -Path managed/Directory.Build.props -Pattern '<Version>([0-9]+\.[0-9]+\.[0-9]+)</Version>'
+          if (-not $managedMatch -or $managedMatch.Matches[0].Groups[1].Value -ne $version) {
+            throw 'The managed package version does not match the CMake project version.'
+          }
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw "Tag $env:GITHUB_REF_NAME does not match project version v$version."
           }
@@ -64,6 +73,27 @@ jobs:
         shell: pwsh
         run: ctest --test-dir out/build/windows -C Release --output-on-failure
 
+      - name: Build and test managed client
+        shell: pwsh
+        run: |
+          dotnet restore managed/Syncer.Managed.slnx
+          dotnet build managed/Syncer.Managed.slnx --configuration Release --no-restore
+          dotnet test managed/Syncer.Managed.slnx --configuration Release --no-build --no-restore
+
+      - name: Pack managed client and tool
+        shell: pwsh
+        run: ./scripts/build-managed-packages.ps1 -Configuration Release -NoRestore
+
+      - name: Verify managed release packages
+        shell: pwsh
+        run: |
+          $env:SYNCER_REQUIRE_EMBEDDED_SERVERS = '1'
+          dotnet test managed/tests/Syncer.Client.Tests/Syncer.Client.Tests.csproj --configuration Release --no-restore -p:SyncerServerRoot="$PWD/out/package/syncer-Release/servers" --filter EmbeddedServerSetIsCompleteWhenPresent
+          $toolPath = Join-Path $PWD 'out/release-tool-test'
+          dotnet tool install Syncer.Tool --tool-path $toolPath --version "${{ steps.version.outputs.version }}" --add-source "$PWD/out/package/nuget" --no-cache
+          & (Join-Path $toolPath 'syncer-managed.exe') version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged managed tool failed with exit code $LASTEXITCODE." }
+
       - name: Create ZIP archive
         id: archive
         shell: pwsh
@@ -73,11 +103,25 @@ jobs:
           Compress-Archive -Path 'out/package/syncer-Release/*' -DestinationPath $archive -CompressionLevel Optimal
           "path=$archive" >> $env:GITHUB_OUTPUT
 
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $files = @('${{ steps.archive.outputs.path }}') +
+            @(Get-ChildItem 'out/package/nuget' -File -Filter '*.nupkg' | ForEach-Object FullName)
+          foreach ($file in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            Set-Content -LiteralPath "$file.sha256" -Encoding ascii -Value "$hash  $([IO.Path]::GetFileName($file))"
+          }
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
           name: syncer-release
-          path: ${{ steps.archive.outputs.path }}
+          path: |
+            ${{ steps.archive.outputs.path }}
+            ${{ steps.archive.outputs.path }}.sha256
+            out/package/nuget/*.nupkg
+            out/package/nuget/*.nupkg.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -100,6 +144,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset="$(find dist -maxdepth 1 -name '*.zip' -print -quit)"
-          test -n "$asset"
-          gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --generate-notes
+          mapfile -d '' assets < <(find dist -type f -print0)
+          test "${#assets[@]}" -gt 0
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --generate-notes

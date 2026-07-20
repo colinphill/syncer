@@ -1020,7 +1020,17 @@ void Server::delete_path(ByteReader& reader) {
     if (error && error != std::errc::no_such_file_or_directory)
         throw Error(ExitCode::transfer, "cannot inspect destination path");
     if (!fs::exists(status)) return;
-    if (recovery_root_.empty()) throw Error(ExitCode::safety, "no recovery run was selected");
+    const auto prefix = relative + "/";
+    if (recovery_root_.empty()) {
+        fs::remove_all(destination, error);
+        if (error) throw Error(ExitCode::transfer, "cannot permanently delete destination path");
+        for (auto iterator = logical_times_.begin(); iterator != logical_times_.end();) {
+            if (iterator->first == relative || iterator->first.starts_with(prefix)) iterator = logical_times_.erase(iterator);
+            else ++iterator;
+        }
+        metadata_dirty_ = true;
+        return;
+    }
     ManifestEntry quarantined{relative, EntryType::other, 0, 0};
     if (fs::is_regular_file(status)) {
         quarantined.type = EntryType::file;
@@ -1045,7 +1055,6 @@ void Server::delete_path(ByteReader& reader) {
     if (fs::exists(recovery)) throw Error(ExitCode::transfer, "recovery path already exists");
     fs::rename(destination, recovery, error);
     if (error) throw Error(ExitCode::transfer, "cannot quarantine destination path");
-    const auto prefix = relative + "/";
     for (const auto& [path, logical] : logical_times_) {
         if (path == relative || path.starts_with(prefix))
             append_recovery_entry("LOGICAL", ManifestEntry{path, logical.type,

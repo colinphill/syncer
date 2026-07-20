@@ -647,7 +647,8 @@ void print_changes(const SyncPlan& plan) {
 }
 
 void apply_deletions(ClientSession& session, const SyncPlan& plan,
-                     std::size_t& applied_deletions, std::size_t& applied_quarantines) {
+                     bool recovery_enabled, std::size_t& applied_deletions,
+                     std::size_t& applied_quarantines) {
     std::set<std::string, std::less<>> paths;
     for (const auto& change : plan.deletions) paths.insert(change.entry.path);
     for (const auto& change : plan.deletions) {
@@ -661,7 +662,7 @@ void apply_deletions(ClientSession& session, const SyncPlan& plan,
         }
         if (covered) continue;
         session.delete_path(change.entry.path);
-        ++applied_quarantines;
+        if (recovery_enabled) ++applied_quarantines;
     }
     applied_deletions = plan.deletions.size();
 }
@@ -684,8 +685,10 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
         session.select_root(saved.destination);
         session.validate_plan(saved.preconditions);
         if (saved.plan.files.empty() && saved.plan.directories.empty() && saved.plan.deletions.empty()) return;
-        recovery_id = random_token().substr(0, 24);
-        session.prepare(recovery_id);
+        if (!saved.options.direct) {
+            recovery_id = random_token().substr(0, 24);
+            session.prepare(recovery_id);
+        }
         if (!saved.options.direct) {
             for (const auto& change : saved.plan.files) {
                 std::cerr << "Staging " << change.entry.path << "\n";
@@ -696,7 +699,7 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
         for (const auto& change : saved.plan.directories) {
             if (change.action == PlanAction::replace_with_directory) {
                 session.delete_path(change.entry.path);
-                ++applied_quarantines;
+                if (!saved.options.direct) ++applied_quarantines;
             }
             session.make_directory(change.entry);
             ++applied_directories;
@@ -704,7 +707,7 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
         for (const auto& change : saved.plan.files) {
             if (change.action == PlanAction::update_file || change.action == PlanAction::replace_with_file) {
                 session.delete_path(change.entry.path);
-                ++applied_quarantines;
+                if (!saved.options.direct) ++applied_quarantines;
             }
             if (saved.options.direct) {
                 std::cerr << "Transferring " << change.entry.path << "\n";
@@ -715,7 +718,8 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
             }
             ++applied_files;
         }
-        apply_deletions(session, saved.plan, applied_deletions, applied_quarantines);
+        apply_deletions(session, saved.plan, !saved.options.direct,
+                        applied_deletions, applied_quarantines);
     });
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -821,8 +825,10 @@ int execute(const Options& options, CancellationState& cancellation) {
                            adb.serial(), digest, planned_removals);
         if (options.dry_run) return;
         if (plan.files.empty() && plan.directories.empty() && plan.deletions.empty()) return;
-        recovery_id = random_token().substr(0, 24);
-        session.prepare(recovery_id);
+        if (!options.direct) {
+            recovery_id = random_token().substr(0, 24);
+            session.prepare(recovery_id);
+        }
         const auto verify_source_tree = [&] {
             try {
                 const auto current_source = scan_source(source_path, exclusions);
@@ -849,7 +855,7 @@ int execute(const Options& options, CancellationState& cancellation) {
         for (const auto& change : plan.directories) {
             if (change.action == PlanAction::replace_with_directory) {
                 session.delete_path(change.entry.path);
-                ++applied_quarantines;
+                if (!options.direct) ++applied_quarantines;
             }
             session.make_directory(change.entry);
             ++applied_directories;
@@ -857,7 +863,7 @@ int execute(const Options& options, CancellationState& cancellation) {
         for (const auto& change : plan.files) {
             if (change.action == PlanAction::update_file || change.action == PlanAction::replace_with_file) {
                 session.delete_path(change.entry.path);
-                ++applied_quarantines;
+                if (!options.direct) ++applied_quarantines;
             }
             if (options.direct) {
                 std::cerr << "Transferring " << change.entry.path << "\n";
@@ -868,7 +874,8 @@ int execute(const Options& options, CancellationState& cancellation) {
             ++applied_files;
         }
         if (options.direct) verify_source_tree();
-        apply_deletions(session, plan, applied_deletions, applied_quarantines);
+        apply_deletions(session, plan, !options.direct,
+                        applied_deletions, applied_quarantines);
     });
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     if (options.json) {

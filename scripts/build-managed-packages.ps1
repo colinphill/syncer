@@ -1,6 +1,7 @@
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
-    [string]$ServerRoot
+    [string]$ServerRoot,
+    [switch]$NoRestore
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,10 +17,14 @@ foreach ($abi in $required) {
 $output = Join-Path $projectRoot 'out/package/nuget'
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $serverProperty = (Resolve-Path $ServerRoot).Path
+if (-not $NoRestore) {
+    dotnet restore (Join-Path $projectRoot 'managed/Syncer.Managed.slnx')
+    if ($LASTEXITCODE -ne 0) { throw "Managed solution restore failed with exit code $LASTEXITCODE." }
+}
 dotnet pack (Join-Path $projectRoot 'managed/src/Syncer.Client/Syncer.Client.csproj') `
-    --configuration $Configuration --output $output -p:SyncerServerRoot=$serverProperty
+    --configuration $Configuration --output $output --no-restore -p:SyncerServerRoot=$serverProperty
 if ($LASTEXITCODE -ne 0) { throw "Syncer.Client pack failed with exit code $LASTEXITCODE." }
 dotnet pack (Join-Path $projectRoot 'managed/src/Syncer.Tool/Syncer.Tool.csproj') `
-    --configuration $Configuration --output $output -p:SyncerServerRoot=$serverProperty
+    --configuration $Configuration --output $output --no-restore -p:SyncerServerRoot=$serverProperty
 if ($LASTEXITCODE -ne 0) { throw "Syncer.Tool pack failed with exit code $LASTEXITCODE." }
 Write-Host "Managed packages created at $output"

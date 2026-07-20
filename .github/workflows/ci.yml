@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -127,10 +127,13 @@ jobs:
       - name: Pack and verify managed packages
         shell: pwsh
         run: |
-          ./scripts/build-managed-packages.ps1 -Configuration Release
+          ./scripts/build-managed-packages.ps1 -Configuration Release -NoRestore
           $env:SYNCER_REQUIRE_EMBEDDED_SERVERS = '1'
           dotnet test managed/tests/Syncer.Client.Tests/Syncer.Client.Tests.csproj --configuration Release --no-restore -p:SyncerServerRoot="$PWD/out/package/syncer-Release/servers" --filter EmbeddedServerSetIsCompleteWhenPresent
+          $match = Select-String -Path CMakeLists.txt -Pattern '^project\(syncer VERSION ([0-9]+\.[0-9]+\.[0-9]+) '
+          if (-not $match) { throw 'Could not read the project version from CMakeLists.txt.' }
+          $version = $match.Matches[0].Groups[1].Value
           $toolPath = Join-Path $PWD 'out/tool-test'
-          dotnet tool install Syncer.Tool --tool-path $toolPath --version 0.2.0 --add-source "$PWD/out/package/nuget" --no-cache
+          dotnet tool install Syncer.Tool --tool-path $toolPath --version $version --add-source "$PWD/out/package/nuget" --no-cache
           & (Join-Path $toolPath 'syncer-managed.exe') version
           if ($LASTEXITCODE -ne 0) { throw "Packaged managed tool failed with exit code $LASTEXITCODE." }

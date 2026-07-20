@@ -60,9 +60,10 @@ single `manifest_entry` is also accepted), followed by `manifest_end`, all with 
 ## Required sequences
 
 The first frame is always `hello`, authenticated with the random token passed to `syncerd` on its
-command line. Normal push is `scan`, optional `prepare`, staged uploads, replacement quarantine,
-directory creation, file commits, destination-only quarantine, and `shutdown`. Direct mode places
-directory creation before uploads and does not send `commit_file`. Saved-plan execution uses
+command line. Normal push is `scan`, `prepare`, staged uploads, replacement quarantine,
+directory creation, file commits, destination-only quarantine, and `shutdown`. Direct mode omits
+`prepare`, permanently removes replaced and destination-only paths, places directory creation
+before uploads, and does not send `commit_file`. Saved-plan execution uses
 `select_root`, one or more `validate_plan` requests, then the same mutation sequence. Restore uses
 `select_root`, `restore`, and `shutdown`.
 

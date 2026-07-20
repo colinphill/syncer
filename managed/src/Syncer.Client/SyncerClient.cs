@@ -102,43 +102,86 @@ public sealed class SyncerClient
         IProgress<SyncerProgress>? progress, CancellationToken cancellationToken)
     {
         if (!plan.HasChanges) return new(null, 0, 0, 0, 0, 0);
-        var recoveryId = Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
-        await session.PrepareAsync(recoveryId, cancellationToken).ConfigureAwait(false); var files = 0; var directories = 0; var quarantined = 0; ulong bytes = 0;
+        string? recoveryId = null;
+        if (!plan.Options.Direct)
+        {
+            recoveryId = Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
+            await session.PrepareAsync(recoveryId, cancellationToken).ConfigureAwait(false);
+        }
+        var files = 0; var directories = 0; var quarantined = 0; ulong bytes = 0;
         if (!plan.Options.Direct)
         {
             foreach (var change in plan.Files)
             {
-                progress?.Report(new(SyncerProgressStage.StagingFile, change.Path)); await session.UploadAsync(plan.SourceFiles[change.Path], false, progress, cancellationToken).ConfigureAwait(false); bytes += change.Entry.Size;
+                await RunChangeAsync(change, SyncerProgressStage.StagingFile, reportCompletion: false,
+                    progress, () => session.UploadAsync(plan.SourceFiles[change.Path], false,
+                        progress, cancellationToken)).ConfigureAwait(false);
+                bytes += change.Entry.Size;
             }
             if (verifyWholeTree) await VerifyTreeAsync(plan, freshSource!, cancellationToken).ConfigureAwait(false);
         }
         else if (verifyWholeTree) await VerifyTreeAsync(plan, freshSource!, cancellationToken).ConfigureAwait(false);
         foreach (var change in plan.Directories)
         {
-            progress?.Report(new(SyncerProgressStage.Applying, change.Path, change));
-            if (change.Action == PlanAction.ReplaceWithDirectory) { await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); quarantined++; }
-            await session.MakeDirectoryAsync(change.Entry, cancellationToken).ConfigureAwait(false); directories++;
+            await RunChangeAsync(change, SyncerProgressStage.Applying, reportCompletion: true,
+                progress, async () =>
+                {
+                    if (change.Action == PlanAction.ReplaceWithDirectory) { await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); if (recoveryId is not null) quarantined++; }
+                    await session.MakeDirectoryAsync(change.Entry, cancellationToken).ConfigureAwait(false); directories++;
+                }).ConfigureAwait(false);
         }
         foreach (var change in plan.Files)
         {
-            progress?.Report(new(SyncerProgressStage.Applying, change.Path, change));
-            if (change.Action is PlanAction.UpdateFile or PlanAction.ReplaceWithFile) { await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); quarantined++; }
-            if (plan.Options.Direct)
-            {
-                progress?.Report(new(SyncerProgressStage.TransferringFile, change.Path)); await session.UploadAsync(plan.SourceFiles[change.Path], true, progress, cancellationToken).ConfigureAwait(false); bytes += change.Entry.Size;
-            }
-            else await session.CommitFileAsync(change.Path, cancellationToken).ConfigureAwait(false);
-            files++;
+            await RunChangeAsync(change, SyncerProgressStage.Applying, reportCompletion: true,
+                progress, async () =>
+                {
+                    if (change.Action is PlanAction.UpdateFile or PlanAction.ReplaceWithFile) { await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); if (recoveryId is not null) quarantined++; }
+                    if (plan.Options.Direct)
+                    {
+                        progress?.Report(new(SyncerProgressStage.TransferringFile, change.Path, change)); await session.UploadAsync(plan.SourceFiles[change.Path], true, progress, cancellationToken).ConfigureAwait(false); bytes += change.Entry.Size;
+                    }
+                    else await session.CommitFileAsync(change.Path, cancellationToken).ConfigureAwait(false);
+                    files++;
+                }).ConfigureAwait(false);
         }
         if (plan.Options.Direct && verifyWholeTree) await VerifyTreeAsync(plan, freshSource!, cancellationToken).ConfigureAwait(false);
         var deletionPaths = new HashSet<string>(plan.Deletions.Select(change => change.Path), StringComparer.Ordinal);
+        var deletionGroups = new Dictionary<string, List<PlannedChange>>(StringComparer.Ordinal);
         foreach (var change in plan.Deletions)
         {
-            var parent = change.Path; var covered = false;
-            while (parent.LastIndexOf('/') is var slash && slash >= 0) { parent = parent[..slash]; if (deletionPaths.Contains(parent)) { covered = true; break; } }
-            if (!covered) { progress?.Report(new(SyncerProgressStage.Applying, change.Path, change)); await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); quarantined++; }
+            var root = change.Path; var parent = change.Path;
+            while (parent.LastIndexOf('/') is var slash && slash >= 0) { parent = parent[..slash]; if (deletionPaths.Contains(parent)) root = parent; }
+            if (!deletionGroups.TryGetValue(root, out var group)) deletionGroups.Add(root, group = []);
+            group.Add(change);
+        }
+        foreach (var change in plan.Deletions)
+        {
+            if (!deletionGroups.TryGetValue(change.Path, out var group)) continue;
+            progress?.Report(new(SyncerProgressStage.Applying, change.Path, change));
+            try { await session.DeletePathAsync(change.Path, cancellationToken).ConfigureAwait(false); if (recoveryId is not null) quarantined++; }
+            catch
+            {
+                foreach (var affected in group) progress?.Report(new(SyncerProgressStage.FailedChange, affected.Path, affected));
+                throw;
+            }
+            foreach (var affected in group) progress?.Report(new(SyncerProgressStage.CompletedChange, affected.Path, affected));
         }
         return new(recoveryId, files, directories, plan.Deletions.Count, quarantined, bytes);
+    }
+
+    internal static async Task RunChangeAsync(
+        PlannedChange change, SyncerProgressStage startingStage, bool reportCompletion,
+        IProgress<SyncerProgress>? progress, Func<Task> action)
+    {
+        progress?.Report(new(startingStage, change.Path, change));
+        try { await action().ConfigureAwait(false); }
+        catch
+        {
+            progress?.Report(new(SyncerProgressStage.FailedChange, change.Path, change));
+            throw;
+        }
+        if (reportCompletion)
+            progress?.Report(new(SyncerProgressStage.CompletedChange, change.Path, change));
     }
 
     private static async Task VerifyTreeAsync(SyncPlan plan, SourceTree original, CancellationToken cancellationToken)
