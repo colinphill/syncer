@@ -35,8 +35,11 @@ foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) {
     if ($LASTEXITCODE -ne 0) { throw "$abi build failed with exit code $LASTEXITCODE." }
 }
 
-if (Test-Path $packageRoot) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+if (Test-Path $packageRoot) {
+    Get-ChildItem -LiteralPath $packageRoot -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+}
 Copy-Item (Join-Path $projectRoot "out/build/windows/$Configuration/syncer.exe") $packageRoot
 foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) {
     $serverDirectory = Join-Path $packageRoot "servers/$abi"

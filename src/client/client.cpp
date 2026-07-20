@@ -10,7 +10,12 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <thread>
+
+#ifndef _WIN32
+#include <sys/socket.h>
+#endif
 
 namespace syncer::client {
 namespace fs = std::filesystem;
@@ -127,7 +132,53 @@ Manifest ClientSession::scan(std::string_view device_path) {
     return manifest;
 }
 
-void ClientSession::prepare() { operation(MessageType::prepare); }
+void ClientSession::select_root(std::string_view device_path) {
+    ByteWriter writer;
+    writer.string(device_path);
+    operation(MessageType::select_root, std::move(writer).take());
+}
+
+void ClientSession::validate_plan(const std::vector<DestinationPrecondition>& preconditions) {
+    if (preconditions.size() > std::numeric_limits<std::uint32_t>::max())
+        throw Error(ExitCode::safety, "saved plan has too many destination preconditions");
+    std::size_t begin{};
+    while (begin < preconditions.size()) {
+        std::size_t end = begin;
+        std::size_t encoded_size = 4;
+        while (end < preconditions.size()) {
+            const auto& value = preconditions[end];
+            const auto next_size = 4U + value.path.size() + 1U +
+                (value.exists ? 4U + value.entry.path.size() + 1U + 8U + 8U : 0U);
+            if (end != begin && encoded_size + next_size > kMaxFramePayload - 1024U) break;
+            if (encoded_size + next_size > kMaxFramePayload)
+                throw Error(ExitCode::safety, "saved plan contains an oversized destination path");
+            encoded_size += next_size;
+            ++end;
+        }
+        ByteWriter writer;
+        writer.u32(static_cast<std::uint32_t>(end - begin));
+        for (std::size_t index = begin; index < end; ++index) {
+            const auto& precondition = preconditions[index];
+            writer.string(precondition.path);
+            writer.u8(precondition.exists ? 1 : 0);
+            if (precondition.exists) encode_manifest_entry(writer, precondition.entry);
+        }
+        operation(MessageType::validate_plan, std::move(writer).take());
+        begin = end;
+    }
+}
+
+void ClientSession::restore(std::string_view recovery_id) {
+    ByteWriter writer;
+    writer.string(recovery_id);
+    operation(MessageType::restore, std::move(writer).take());
+}
+
+void ClientSession::prepare(std::string_view recovery_id) {
+    ByteWriter writer;
+    writer.string(recovery_id);
+    operation(MessageType::prepare, std::move(writer).take());
+}
 
 void ClientSession::upload(const SourceFile& source, bool direct) {
     verify_source(source);
@@ -168,6 +219,14 @@ void ClientSession::commit_file(std::string_view path) {
 }
 void ClientSession::delete_path(std::string_view path) {
     ByteWriter writer; writer.string(path); operation(MessageType::delete_path, std::move(writer).take());
+}
+void ClientSession::cancel() noexcept {
+    if (!socket_.is_open()) return;
+#ifdef _WIN32
+    (void)::shutdown(socket_.native_handle(), SD_BOTH);
+#else
+    (void)::shutdown(socket_.native_handle(), SHUT_RDWR);
+#endif
 }
 void ClientSession::shutdown() noexcept {
     if (!socket_.is_open()) return;

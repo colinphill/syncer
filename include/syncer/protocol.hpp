@@ -29,6 +29,9 @@ enum class MessageType : std::uint16_t {
     shutdown = 16,
     manifest_batch = 17,
     prepare = 18,
+    select_root = 19,
+    validate_plan = 20,
+    restore = 21,
 };
 
 enum class UploadPlacement : std::uint8_t { staged = 0, direct = 1 };

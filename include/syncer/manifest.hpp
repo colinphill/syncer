@@ -45,6 +45,12 @@ struct SyncPlan {
     std::uint64_t transfer_bytes{};
 };
 
+struct DestinationPrecondition {
+    std::string path;
+    bool exists{};
+    ManifestEntry entry;
+};
+
 [[nodiscard]] SyncPlan make_plan(const Manifest& source, const Manifest& destination,
                                  const GlobSet& exclusions, bool delete_extras,
                                  std::uint64_t mtime_tolerance_seconds = 60);

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -28,6 +29,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_set>
 #include <unistd.h>
 #include <vector>
 
@@ -84,7 +86,102 @@ bool ascii_iequals(std::string_view left, std::string_view right) {
     });
 }
 
-std::vector<fs::path> removable_storage_roots(const fs::path& internal) {
+std::optional<fs::path> internal_storage_root() {
+    std::vector<fs::path> candidates;
+    if (const char* configured = std::getenv("EXTERNAL_STORAGE"); configured && *configured)
+        candidates.emplace_back(configured);
+    candidates.emplace_back("/sdcard");
+    candidates.emplace_back("/storage/emulated/0");
+    candidates.emplace_back("/storage/self/primary");
+    for (const auto& candidate : candidates) {
+        std::error_code error;
+        const auto resolved = fs::canonical(candidate, error);
+        if (!error) return resolved;
+    }
+    return std::nullopt;
+}
+
+bool valid_recovery_id(std::string_view value) {
+    return !value.empty() && value.size() <= 128 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isalnum(character) || character == '-' || character == '_';
+        });
+}
+
+std::string hex_encode(std::string_view value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size() * 2);
+    for (const auto character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        result.push_back(digits[byte >> 4U]);
+        result.push_back(digits[byte & 15U]);
+    }
+    return result;
+}
+
+std::string hex_decode(std::string_view value) {
+    const auto digit = [](char character) -> int {
+        if (character >= '0' && character <= '9') return character - '0';
+        if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+        if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+        return -1;
+    };
+    if ((value.size() & 1U) != 0) throw Error(ExitCode::safety, "recovery journal has an invalid path");
+    std::string result;
+    result.reserve(value.size() / 2);
+    for (std::size_t index = 0; index < value.size(); index += 2) {
+        const auto high = digit(value[index]);
+        const auto low = digit(value[index + 1]);
+        if (high < 0 || low < 0) throw Error(ExitCode::safety, "recovery journal has an invalid path");
+        result.push_back(static_cast<char>((high << 4) | low));
+    }
+    if (!valid_relative_path(result)) throw Error(ExitCode::safety, "recovery journal has an unsafe path");
+    return result;
+}
+
+std::vector<std::string_view> split_fields(const std::string& line) {
+    std::vector<std::string_view> result;
+    std::string_view remaining(line);
+    while (true) {
+        const auto separator = remaining.find('\t');
+        result.push_back(remaining.substr(0, separator));
+        if (separator == remaining.npos) break;
+        remaining.remove_prefix(separator + 1);
+    }
+    return result;
+}
+
+template <typename Value>
+Value parse_number(std::string_view text) {
+    Value value{};
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+        throw Error(ExitCode::safety, "recovery journal has an invalid number");
+    return value;
+}
+
+std::vector<std::string> topmost_paths(std::vector<std::string> paths) {
+    std::sort(paths.begin(), paths.end(), [](const auto& left, const auto& right) {
+        const auto left_depth = path_depth(left), right_depth = path_depth(right);
+        return left_depth != right_depth ? left_depth < right_depth : left < right;
+    });
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    std::vector<std::string> result;
+    for (auto& path : paths) {
+        bool covered{};
+        for (const auto& parent : result) {
+            if (path.size() > parent.size() && path.starts_with(parent) && path[parent.size()] == '/') {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) result.push_back(std::move(path));
+    }
+    return result;
+}
+
+std::vector<fs::path> removable_storage_roots(const std::optional<fs::path>& internal) {
     std::error_code error;
     const auto storage = fs::canonical("/storage", error);
     if (error) throw Error(ExitCode::safety, "cannot resolve Android storage mount directory");
@@ -99,7 +196,7 @@ std::vector<fs::path> removable_storage_roots(const fs::path& internal) {
         if (error || !fs::is_directory(status)) continue;
         const auto root = fs::canonical(entries->path(), error);
         if (error) { error.clear(); continue; }
-        if (root == internal || !is_descendant(root, storage)) continue;
+        if ((internal && root == *internal) || !is_descendant(root, storage)) continue;
         roots.push_back(root);
     }
     std::sort(roots.begin(), roots.end());
@@ -178,7 +275,21 @@ void Server::dispatch(LocalSocket& client, const Frame& frame) {
     switch (frame.type) {
     case MessageType::initialize: initialize_root(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::scan: select_managed_root(reader); reader.require_end(); send_manifest(client, frame.request_id); break;
-    case MessageType::prepare: reader.require_end(); prepare_mutation(); send_ok(client, frame.request_id); break;
+    case MessageType::select_root: select_managed_root(reader); reader.require_end(); send_ok(client, frame.request_id); break;
+    case MessageType::validate_plan: validate_plan(reader); reader.require_end(); send_ok(client, frame.request_id); break;
+    case MessageType::restore: restore_recovery(reader); reader.require_end(); send_ok(client, frame.request_id); break;
+    case MessageType::prepare:
+        {
+            const auto recovery_id = reader.string();
+            reader.require_end();
+            if (!valid_recovery_id(recovery_id))
+                throw Error(ExitCode::safety, "invalid recovery identifier");
+            recovery_root_ = root_ / kReservedDirectory / "recovery" / recovery_id / "files";
+            recovery_journal_ = recovery_root_.parent_path() / "journal.tsv";
+            prepare_mutation();
+            send_ok(client, frame.request_id);
+            break;
+        }
     case MessageType::make_directory: make_directory(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::put_begin: put_begin(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::put_chunk: put_chunk(frame); break;
@@ -189,6 +300,7 @@ void Server::dispatch(LocalSocket& client, const Frame& frame) {
     case MessageType::shutdown:
         reader.require_end();
         save_metadata();
+        if (!recovery_root_.empty()) append_recovery_journal("COMMIT", "-");
         stop_ = true;
         send_ok(client, frame.request_id);
         break;
@@ -207,11 +319,8 @@ void Server::send_error(LocalSocket& client, std::uint32_t request_id, ExitCode 
 }
 
 fs::path Server::validate_root(std::string_view requested, bool allow_missing) const {
-    const char* external_value = std::getenv("EXTERNAL_STORAGE");
-    const fs::path external_raw = external_value && *external_value ? external_value : "/sdcard";
+    const auto internal = internal_storage_root();
     std::error_code error;
-    const auto internal = fs::canonical(external_raw, error);
-    if (error) throw Error(ExitCode::safety, "cannot resolve Android shared-storage root");
     const auto removable = removable_storage_roots(internal);
     fs::path raw(requested);
     if (!raw.is_absolute()) {
@@ -240,7 +349,7 @@ fs::path Server::validate_root(std::string_view requested, bool allow_missing) c
     }
     auto candidate = allow_missing ? fs::weakly_canonical(raw, error) : fs::canonical(raw, error);
     if (error) throw Error(ExitCode::safety, "cannot resolve Android destination");
-    bool allowed = is_descendant(candidate, internal);
+    bool allowed = internal && is_descendant(candidate, *internal);
     for (const auto& root : removable) allowed = allowed || is_descendant(candidate, root);
     if (!allowed) throw Error(ExitCode::safety, "destination must be below internal shared storage or a mounted removable SD card");
     return candidate;
@@ -301,6 +410,59 @@ void Server::select_managed_root(ByteReader& reader) {
     load_metadata();
 }
 
+void Server::validate_plan(ByteReader& reader) {
+    require_root();
+    const auto count = reader.u32();
+    if (count > 1000000U)
+        throw Error(ExitCode::safety, "saved plan has too many destination preconditions");
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto relative = reader.string();
+        const bool expected_exists = reader.u8() != 0;
+        std::optional<ManifestEntry> expected;
+        if (expected_exists) {
+            expected = decode_manifest_entry(reader);
+            if (expected->path != relative)
+                throw Error(ExitCode::safety, "saved plan has an invalid destination precondition");
+        }
+        if (!valid_relative_path(relative) || relative == kReservedDirectory ||
+            relative.starts_with(std::string(kReservedDirectory) + "/"))
+            throw Error(ExitCode::safety, "saved plan has an invalid destination path");
+
+        const auto path = destination_path(relative, false);
+        std::error_code error;
+        const auto status = fs::symlink_status(path, error);
+        if (error && error != std::errc::no_such_file_or_directory)
+            throw Error(ExitCode::transfer, "cannot inspect saved-plan destination path");
+        const bool exists = !error && fs::exists(status);
+        if (exists != expected_exists)
+            throw Error(ExitCode::source_changed,
+                        "destination changed after the plan was saved: " + relative);
+        if (!exists) continue;
+
+        ManifestEntry actual{relative, EntryType::other, 0, 0};
+        if (fs::is_regular_file(status)) {
+            actual.type = EntryType::file;
+            actual.size = fs::file_size(path, error);
+            if (error) throw Error(ExitCode::transfer, "cannot inspect saved-plan destination file");
+            const auto logical = logical_times_.find(relative);
+            if (logical != logical_times_.end() && logical->second.type == EntryType::file &&
+                logical->second.size == actual.size) {
+                actual.modified_seconds = logical->second.modified_seconds;
+            } else {
+                struct stat value{};
+                if (::lstat(path.c_str(), &value) != 0)
+                    throw Error(ExitCode::transfer, "cannot inspect saved-plan destination file");
+                actual.modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec);
+            }
+        } else if (fs::is_directory(status)) {
+            actual.type = EntryType::directory;
+        }
+        if (actual != *expected)
+            throw Error(ExitCode::source_changed,
+                        "destination changed after the plan was saved: " + relative);
+    }
+}
+
 void Server::prepare_mutation() {
     require_root();
     const auto temporary = root_ / kReservedDirectory / "tmp";
@@ -308,6 +470,154 @@ void Server::prepare_mutation() {
     fs::remove_all(temporary, error);
     if (error) throw Error(ExitCode::transfer, "cannot clear stale temporary files");
     fs::create_directories(temporary);
+    if (recovery_root_.empty()) throw Error(ExitCode::safety, "no recovery run was selected");
+    if (fs::exists(recovery_root_.parent_path()))
+        throw Error(ExitCode::safety, "recovery identifier is already in use");
+    fs::create_directories(recovery_root_);
+    append_recovery_journal("FORMAT", "2");
+    append_recovery_journal("BEGIN", "-");
+}
+
+void Server::append_recovery_journal(std::string_view action, std::string_view relative) {
+    std::ofstream output(recovery_journal_, std::ios::binary | std::ios::app);
+    output << action << '\t' << relative << '\n';
+    if (!output) throw Error(ExitCode::transfer, "cannot write recovery journal");
+}
+
+void Server::append_recovery_entry(std::string_view action, const ManifestEntry& entry) {
+    std::ofstream output(recovery_journal_, std::ios::binary | std::ios::app);
+    output << action << '\t' << hex_encode(entry.path) << '\t'
+           << static_cast<unsigned>(entry.type) << '\t' << entry.size << '\t'
+           << entry.modified_seconds << '\n';
+    if (!output) throw Error(ExitCode::transfer, "cannot write recovery journal");
+}
+
+void Server::restore_recovery(ByteReader& reader) {
+    require_root();
+    const auto recovery_id = reader.string();
+    if (!valid_recovery_id(recovery_id)) throw Error(ExitCode::safety, "invalid recovery identifier");
+    const auto run_root = root_ / kReservedDirectory / "recovery" / recovery_id;
+    const auto files_root = run_root / "files";
+    const auto displaced_root = run_root / "displaced";
+    const auto journal = run_root / "journal.tsv";
+    std::ifstream input(journal, std::ios::binary);
+    if (!input) throw Error(ExitCode::safety, "recovery run was not found");
+
+    std::vector<ManifestEntry> quarantined, installed, logical;
+    bool format{}, began{}, committed{}, restore_started{}, restored{};
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto fields = split_fields(line);
+        if (fields.size() == 2 && fields[0] == "FORMAT") {
+            format = fields[1] == "2";
+        } else if (fields.size() == 2 && fields[0] == "BEGIN") {
+            began = true;
+        } else if (fields.size() == 2 && fields[0] == "COMMIT") {
+            committed = true;
+        } else if (fields.size() == 2 && fields[0] == "RESTORE_BEGIN") {
+            restore_started = true;
+        } else if (fields.size() == 2 && fields[0] == "RESTORE_COMMIT") {
+            restored = true;
+        } else if (fields.size() == 5 &&
+                   (fields[0] == "QUARANTINE" || fields[0] == "INSTALL" || fields[0] == "LOGICAL")) {
+            ManifestEntry entry;
+            entry.path = hex_decode(fields[1]);
+            const auto type = parse_number<unsigned>(fields[2]);
+            if (type < static_cast<unsigned>(EntryType::file) ||
+                type > static_cast<unsigned>(EntryType::other))
+                throw Error(ExitCode::safety, "recovery journal has an invalid entry type");
+            entry.type = static_cast<EntryType>(type);
+            entry.size = parse_number<std::uint64_t>(fields[3]);
+            entry.modified_seconds = parse_number<std::int64_t>(fields[4]);
+            if (fields[0] == "QUARANTINE") quarantined.push_back(std::move(entry));
+            else if (fields[0] == "INSTALL") installed.push_back(std::move(entry));
+            else logical.push_back(std::move(entry));
+        } else {
+            throw Error(ExitCode::safety, "recovery journal is invalid or predates one-click restore");
+        }
+    }
+    if (!input.eof()) throw Error(ExitCode::transfer, "cannot read recovery journal");
+    if (!format || !began || !committed)
+        throw Error(ExitCode::safety, "recovery run is incomplete or predates one-click restore");
+    if (restored) throw Error(ExitCode::safety, "recovery run has already been restored");
+    if (restore_started) throw Error(ExitCode::safety, "a previous restore of this run was interrupted");
+    if (fs::exists(displaced_root)) throw Error(ExitCode::safety, "recovery run already contains displaced restore data");
+
+    std::vector<std::string> affected;
+    affected.reserve(quarantined.size() + installed.size());
+    for (const auto& entry : quarantined) affected.push_back(entry.path);
+    for (const auto& entry : installed) affected.push_back(entry.path);
+    affected = topmost_paths(std::move(affected));
+    std::vector<std::string> backups;
+    backups.reserve(quarantined.size());
+    for (const auto& entry : quarantined) backups.push_back(entry.path);
+    backups = topmost_paths(std::move(backups));
+
+    for (const auto& relative : backups) {
+        std::error_code error;
+        const auto status = fs::symlink_status(files_root / fs::path(relative), error);
+        if (error || !fs::exists(status))
+            throw Error(ExitCode::safety, "recovery data is missing: " + relative);
+    }
+    // Inspect every destination before the first mutation so unsafe parent changes cannot
+    // leave a partially restored run.
+    for (const auto& relative : affected) (void)destination_path(relative, false);
+
+    recovery_journal_ = journal;
+    append_recovery_journal("RESTORE_BEGIN", "-");
+    fs::create_directories(displaced_root);
+    std::vector<std::pair<fs::path, fs::path>> displaced;
+    std::vector<std::pair<fs::path, fs::path>> restored_backups;
+    try {
+        for (const auto& relative : affected) {
+            const auto destination = destination_path(relative, false);
+            std::error_code error;
+            const auto status = fs::symlink_status(destination, error);
+            if (error && error != std::errc::no_such_file_or_directory)
+                throw Error(ExitCode::transfer, "cannot inspect path before restore: " + relative);
+            if (error || !fs::exists(status)) continue;
+            const auto displaced_path = displaced_root / fs::path(relative);
+            fs::create_directories(displaced_path.parent_path());
+            fs::rename(destination, displaced_path, error);
+            if (error) throw Error(ExitCode::transfer, "cannot preserve current path before restore: " + relative);
+            displaced.emplace_back(displaced_path, destination);
+        }
+        for (const auto& relative : backups) {
+            const auto source = files_root / fs::path(relative);
+            const auto destination = destination_path(relative, true);
+            std::error_code error;
+            fs::rename(source, destination, error);
+            if (error) throw Error(ExitCode::transfer, "cannot restore quarantined path: " + relative);
+            restored_backups.emplace_back(destination, source);
+        }
+    } catch (...) {
+        std::error_code ignored;
+        for (auto iterator = restored_backups.rbegin(); iterator != restored_backups.rend(); ++iterator) {
+            fs::create_directories(iterator->second.parent_path(), ignored);
+            fs::rename(iterator->first, iterator->second, ignored);
+        }
+        for (auto iterator = displaced.rbegin(); iterator != displaced.rend(); ++iterator) {
+            fs::create_directories(iterator->second.parent_path(), ignored);
+            fs::rename(iterator->first, iterator->second, ignored);
+        }
+        throw;
+    }
+
+    for (const auto& relative : affected) {
+        const auto prefix = relative + "/";
+        for (auto iterator = logical_times_.begin(); iterator != logical_times_.end();) {
+            if (iterator->first == relative || iterator->first.starts_with(prefix)) iterator = logical_times_.erase(iterator);
+            else ++iterator;
+        }
+    }
+    for (const auto& entry : logical) {
+        std::error_code error;
+        if (fs::exists(root_ / fs::path(entry.path), error))
+            logical_times_[entry.path] = LogicalTime{entry.type, entry.size, entry.modified_seconds};
+    }
+    metadata_dirty_ = true;
+    append_recovery_journal("RESTORE_COMMIT", "-");
 }
 
 void Server::acquire_lock() {
@@ -598,6 +908,8 @@ void Server::make_directory(ByteReader& reader) {
     if (fs::exists(status) && !fs::is_directory(status)) fs::remove_all(path);
     fs::create_directories(path);
     if (logical_times_.erase(relative) != 0) metadata_dirty_ = true;
+    if (!recovery_root_.empty())
+        append_recovery_entry("INSTALL", ManifestEntry{relative, EntryType::directory, 0, 0});
 }
 
 void Server::put_begin(ByteReader& reader) {
@@ -651,6 +963,9 @@ void Server::put_end(ByteReader& reader) {
         logical_times_[upload_->path] =
             LogicalTime{EntryType::file, upload_->received_size, upload_->modified_seconds};
         metadata_dirty_ = true;
+        if (!recovery_root_.empty())
+            append_recovery_entry("INSTALL", ManifestEntry{upload_->path, EntryType::file,
+                upload_->received_size, upload_->modified_seconds});
         upload_.reset();
         return;
     }
@@ -677,6 +992,9 @@ void Server::commit_file(ByteReader& reader) {
     apply_mtime(destination, found->second.modified_seconds);
     logical_times_[relative] = LogicalTime{EntryType::file, found->second.size, found->second.modified_seconds};
     metadata_dirty_ = true;
+    if (!recovery_root_.empty())
+        append_recovery_entry("INSTALL", ManifestEntry{relative, EntryType::file,
+            found->second.size, found->second.modified_seconds});
     staged_.erase(found);
 }
 
@@ -698,9 +1016,42 @@ void Server::delete_path(ByteReader& reader) {
     }
     const auto destination = root_ / relative_path;
     std::error_code error;
-    fs::remove_all(destination, error);
-    if (error) throw Error(ExitCode::transfer, "cannot delete destination path");
+    const auto status = fs::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory)
+        throw Error(ExitCode::transfer, "cannot inspect destination path");
+    if (!fs::exists(status)) return;
+    if (recovery_root_.empty()) throw Error(ExitCode::safety, "no recovery run was selected");
+    ManifestEntry quarantined{relative, EntryType::other, 0, 0};
+    if (fs::is_regular_file(status)) {
+        quarantined.type = EntryType::file;
+        quarantined.size = fs::file_size(destination, error);
+        if (error) throw Error(ExitCode::transfer, "cannot inspect destination file before quarantine");
+        const auto logical = logical_times_.find(relative);
+        if (logical != logical_times_.end() && logical->second.type == EntryType::file &&
+            logical->second.size == quarantined.size) {
+            quarantined.modified_seconds = logical->second.modified_seconds;
+        } else {
+            struct stat value{};
+            if (::lstat(destination.c_str(), &value) != 0)
+                throw Error(ExitCode::transfer, "cannot inspect destination file before quarantine");
+            quarantined.modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec);
+        }
+    } else if (fs::is_directory(status)) {
+        quarantined.type = EntryType::directory;
+    }
+    const auto recovery = recovery_root_ / relative_path;
+    fs::create_directories(recovery.parent_path(), error);
+    if (error) throw Error(ExitCode::transfer, "cannot create recovery directory");
+    if (fs::exists(recovery)) throw Error(ExitCode::transfer, "recovery path already exists");
+    fs::rename(destination, recovery, error);
+    if (error) throw Error(ExitCode::transfer, "cannot quarantine destination path");
     const auto prefix = relative + "/";
+    for (const auto& [path, logical] : logical_times_) {
+        if (path == relative || path.starts_with(prefix))
+            append_recovery_entry("LOGICAL", ManifestEntry{path, logical.type,
+                logical.size, logical.modified_seconds});
+    }
+    append_recovery_entry("QUARANTINE", quarantined);
     for (auto iterator = logical_times_.begin(); iterator != logical_times_.end();) {
         if (iterator->first == relative || iterator->first.starts_with(prefix)) iterator = logical_times_.erase(iterator);
         else ++iterator;

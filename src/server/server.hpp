@@ -48,6 +48,8 @@ private:
     void send_error(LocalSocket& client, std::uint32_t request_id, ExitCode code, std::string_view message);
     void initialize_root(ByteReader& reader);
     void select_managed_root(ByteReader& reader);
+    void validate_plan(ByteReader& reader);
+    void restore_recovery(ByteReader& reader);
     void prepare_mutation();
     void send_manifest(LocalSocket& client, std::uint32_t request_id);
     void make_directory(ByteReader& reader);
@@ -65,10 +67,14 @@ private:
     void require_root() const;
     void load_metadata();
     void save_metadata();
+    void append_recovery_journal(std::string_view action, std::string_view relative);
+    void append_recovery_entry(std::string_view action, const ManifestEntry& entry);
 
     std::string socket_name_;
     std::string token_;
     std::filesystem::path root_;
+    std::filesystem::path recovery_root_;
+    std::filesystem::path recovery_journal_;
     int lock_fd_{-1};
     std::uint64_t upload_counter_{};
     std::unique_ptr<Upload> upload_;

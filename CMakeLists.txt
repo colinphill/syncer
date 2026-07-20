@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(syncer VERSION 0.1.0 LANGUAGES CXX)
+project(syncer VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +34,7 @@ target_include_directories(syncer_core PUBLIC include)
 target_link_libraries(syncer_core PUBLIC Boost::headers Boost::asio Boost::uuid)
 target_compile_definitions(syncer_core PUBLIC
     SYNCER_VERSION="${PROJECT_VERSION}"
-    SYNCER_PROTOCOL_VERSION=3)
+    SYNCER_PROTOCOL_VERSION=6)
 
 if(MSVC)
     target_compile_options(syncer_core PRIVATE /W4 /permissive- /EHsc)

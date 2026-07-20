@@ -12,6 +12,7 @@ enum class ExitCode : int {
     safety = 4,
     transfer = 5,
     source_changed = 6,
+    cancelled = 7,
 };
 
 class Error final : public std::runtime_error {

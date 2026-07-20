@@ -11,8 +11,14 @@ Boost.Asio provides the synchronous TCP and Android local-socket transports. Boo
 ## Safety model
 
 - The destination must be an initialized subdirectory of Android shared storage. The shared-storage root itself is rejected.
+- Internal shared storage is discovered from `EXTERNAL_STORAGE`, `/sdcard`, and standard
+  `/storage` aliases so validation also works when an ADB-launched process has a sparse environment.
 - `init` accepts a new or empty folder. Initializing an existing non-empty folder requires `--adopt`.
-- Push deletes destination-only entries by default. Use `--dry-run` to inspect the plan or `--no-delete` to retain them.
+- Push quarantines destination-only and replaced entries under `.syncer/recovery/<run-id>` by
+  default. Use `--dry-run` to inspect the plan, `--no-delete` to retain destination-only entries,
+  or `--max-removals COUNT` to enforce a removal ceiling.
+- Protocol-6 recovery journals record installed as well as quarantined paths. `restore` removes
+  the installed side, reinstates quarantined originals, and preserves displaced current content.
 - `.syncer/` is reserved for destination identity, locking, and temporary uploads.
 - Excluded paths are neither copied nor deleted.
 - Files are compared by size and whole-second modification time, with a default 60-second tolerance for timestamp noise. Use `--mtime-tolerance SECONDS` to override it; `0` restores exact comparison. A same-size edit within the tolerance is intentionally not detected in v1.
@@ -62,14 +68,18 @@ Pushing a tag matching the CMake project version, such as `v0.1.0`, creates a Wi
 ## Usage
 
 ```text
-syncer init [--adb PATH] [--serial SERIAL] [--adopt] DEVICE_PATH
-syncer push [--adb PATH] [--serial SERIAL] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH
+syncer init [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--adopt] DEVICE_PATH
+syncer push [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--max-removals COUNT] [--expect-plan DIGEST] [--save-plan FILE] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH
+syncer apply [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--json] --plan FILE
+syncer restore [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--json] --recovery ID DEVICE_PATH
 syncer version
 ```
 
 ```powershell
 syncer init /sdcard/MyMirror
-syncer push --dry-run C:\work\assets /sdcard/MyMirror
+syncer push --dry-run --save-plan sync-plan.json C:\work\assets /sdcard/MyMirror
+syncer apply --plan sync-plan.json
+syncer restore --recovery RECOVERY_ID /sdcard/MyMirror
 syncer push --exclude "**/*.tmp" C:\work\assets /sdcard/MyMirror
 syncer push --mtime-tolerance 0 C:\work\assets /sdcard/MyMirror
 syncer push --direct C:\Music music
@@ -77,11 +87,31 @@ syncer init music
 syncer push C:\Music music
 ```
 
+`--save-plan` persists the complete ordered action list, exact source-file identities, selected
+device, and affected destination-path preconditions. `syncer apply --plan` executes that artifact
+without rescanning either complete tree; it validates the saved digest, the device identity, every
+source file being transferred, and the affected destination paths before mutation. `--expect-plan`
+remains available for callers that prefer a fresh full rescan. Successful mutations return the
+recovery run identifier. `--max-removals` counts destination-only entries and entries removed by a
+type replacement; ordinary file updates do not consume the ceiling.
+
+`syncer restore` accepts a recovery identifier returned by a successful protocol-6 mutation.
+It refuses incomplete, legacy, already-restored, or structurally unsafe runs. Current paths that
+must be displaced are retained under `.syncer/recovery/<run-id>/displaced`, making restore
+non-destructive even if destination content changed after the sync.
+
+Integrations may pass `--cancel-stdin` and write a line containing `cancel` to standard input.
+The client interrupts its active protocol operation, waits for the Android server to release the
+destination lock, removes the ADB forward, and exits with code 7. Closing stdin alone does not
+cancel an operation.
+
 As a convenience, `music` may be used instead of an absolute `DEVICE_PATH`. It searches mounted removable storage volumes under `/storage/<volume-id>` for a top-level folder named `music`, case-insensitively; it never selects internal emulated storage. `init music` creates `Music` when exactly one removable volume is mounted and no matching folder exists. Multiple removable volumes require an absolute path, and other relative device paths are rejected.
 
 ADB is found from `--adb`, `ANDROID_HOME`/`ANDROID_SDK_ROOT`, Android Studio's default SDK directory for the host platform, or `PATH`. If multiple devices are ready, select one with `--serial` or `ANDROID_SERIAL`.
 
-Exit codes are `0` success, `2` usage, `3` ADB/device, `4` safety/preflight, `5` protocol/transfer, and `6` source changed during transfer. With `--json`, stdout contains one schema-versioned result or error object; progress goes to stderr.
+Exit codes are `0` success, `2` usage, `3` ADB/device, `4` safety/preflight, `5` protocol/transfer,
+`6` source changed during transfer, and `7` cancelled. With `--json`, stdout contains one
+schema-versioned result or error object; progress goes to stderr.
 
 Before applying or dry-running a push, the client prints every selected change and the comparison reason to the progress stream. Reasons distinguish missing paths, type replacements, size or modification-time differences, and destination-only deletions. With `--json`, these explanations remain on stderr so stdout stays valid JSON.
 

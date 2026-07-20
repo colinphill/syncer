@@ -19,11 +19,15 @@ public:
 
     void initialize(std::string_view device_path, bool adopt);
     [[nodiscard]] Manifest scan(std::string_view device_path);
-    void prepare();
+    void select_root(std::string_view device_path);
+    void validate_plan(const std::vector<DestinationPrecondition>& preconditions);
+    void restore(std::string_view recovery_id);
+    void prepare(std::string_view recovery_id);
     void upload(const SourceFile& source, bool direct);
     void make_directory(const ManifestEntry& entry);
     void commit_file(std::string_view path);
     void delete_path(std::string_view path);
+    void cancel() noexcept;
     void shutdown() noexcept;
 private:
     [[nodiscard]] std::uint32_t next_request() { return ++request_id_; }
