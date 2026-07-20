@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <PackageId>Syncer.Client</PackageId>
+    <Description>Managed client for the syncer Android directory synchronization protocol.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(SyncerServerRoot)' != ''">
+    <EmbeddedResource Include="$(SyncerServerRoot)/arm64-v8a/syncerd" LogicalName="Syncer.Servers.arm64-v8a.syncerd" />
+    <EmbeddedResource Include="$(SyncerServerRoot)/armeabi-v7a/syncerd" LogicalName="Syncer.Servers.armeabi-v7a.syncerd" />
+    <EmbeddedResource Include="$(SyncerServerRoot)/x86_64/syncerd" LogicalName="Syncer.Servers.x86_64.syncerd" />
+    <EmbeddedResource Include="$(SyncerServerRoot)/x86/syncerd" LogicalName="Syncer.Servers.x86.syncerd" />
+  </ItemGroup>
+  <Target Name="ValidateServerResources" BeforeTargets="Pack" Condition="'$(SyncerServerRoot)' == ''">
+    <Error Text="Set SyncerServerRoot to a directory containing the four ABI syncerd binaries when packing Syncer.Client." />
+  </Target>
+</Project>

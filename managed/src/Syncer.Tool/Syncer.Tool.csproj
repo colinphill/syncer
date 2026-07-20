@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <PackageId>Syncer.Tool</PackageId>
+    <Description>Reference command-line tool for Syncer.Client.</Description>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>syncer-managed</ToolCommandName>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Syncer.Client/Syncer.Client.csproj" />
+    <PackageReference Include="System.CommandLine" />
+    <None Include="../Syncer.Client/README.md" Link="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

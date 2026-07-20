@@ -16,11 +16,34 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
 namespace {
 int failures{};
+
+std::map<std::string, std::string> protocol_vectors() {
+    std::ifstream input(std::filesystem::path(SYNCER_TEST_SOURCE_DIR) / "tests" / "protocol-v6-vectors.txt");
+    std::map<std::string, std::string> values;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line.front() == '#') continue;
+        const auto separator = line.find('=');
+        if (separator != std::string::npos) values.emplace(line.substr(0, separator), line.substr(separator + 1));
+    }
+    return values;
+}
+
+std::string bytes_hex(std::span<const std::uint8_t> bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(bytes.size() * 2, '0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        result[index * 2] = digits[bytes[index] >> 4U];
+        result[index * 2 + 1] = digits[bytes[index] & 0xFU];
+    }
+    return result;
+}
 void check(bool condition, const char* expression, int line) {
     if (!condition) { std::cerr << "line " << line << ": check failed: " << expression << '\n'; ++failures; }
 }
@@ -144,6 +167,7 @@ void test_paths_and_plan() {
 }
 
 void test_protocol() {
+    const auto vectors = protocol_vectors();
     syncer::ManifestEntry original{"folder/file.bin", syncer::EntryType::file, 0x100000002ULL, -123};
     syncer::ByteWriter writer;
     syncer::encode_manifest_entry(writer, original);
@@ -155,8 +179,10 @@ void test_protocol() {
     CHECK(decoded.type == original.type);
     CHECK(decoded.size == original.size);
     CHECK(decoded.modified_seconds == original.modified_seconds);
+    CHECK(bytes_hex(payload) == vectors.at("manifest_folder_file"));
     syncer::Frame frame{syncer::MessageType::scan, 42, {1, 2, 3}};
     const auto header = syncer::encode_header(frame);
+    CHECK(bytes_hex(header) == vectors.at("header_scan_request_42_payload_010203"));
     std::array<std::uint8_t, 16> fixed{};
     std::copy(header.begin(), header.end(), fixed.begin());
     const auto decoded_frame = syncer::decode_frame_header(fixed);
@@ -194,6 +220,20 @@ void test_protocol() {
         syncer::ByteReader invalid_reader(bytes);
         (void)syncer::decode_manifest_entry(invalid_reader);
     }));
+
+    syncer::ByteWriter plan_writer;
+    plan_writer.string("SYNCER-PLAN"); plan_writer.u32(1);
+    plan_writer.string("source"); plan_writer.string("/sdcard/target"); plan_writer.string("serial");
+    plan_writer.u8(0); plan_writer.u8(1); plan_writer.i64(0);
+    plan_writer.u32(1); plan_writer.string("**/*.tmp");
+    plan_writer.u32(0);
+    plan_writer.u32(1); plan_writer.u8(static_cast<std::uint8_t>(syncer::PlanAction::add_file));
+    syncer::encode_manifest_entry(plan_writer, {"a.txt", syncer::EntryType::file, 3, 42});
+    plan_writer.string("destination path is missing");
+    plan_writer.u32(0);
+    const auto plan_bytes = std::move(plan_writer).take();
+    syncer::Blake3 plan_hash; plan_hash.update(plan_bytes);
+    CHECK(syncer::digest_hex(plan_hash.finalize()) == vectors.at("plan_digest_reference"));
 }
 
 void test_source_scan() {

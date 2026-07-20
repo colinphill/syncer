@@ -1,4 +1,6 @@
 /out/
+managed/**/bin/
+managed/**/obj/
 /.vs/
 /.vscode/
 *.user

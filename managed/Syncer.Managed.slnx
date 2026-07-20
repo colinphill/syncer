@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Syncer.Client/Syncer.Client.csproj" />
+    <Project Path="src/Syncer.Tool/Syncer.Tool.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Syncer.Client.Tests/Syncer.Client.Tests.csproj" />
+    <Project Path="tests/Syncer.Tool.Tests/Syncer.Tool.Tests.csproj" />
+  </Folder>
+</Solution>

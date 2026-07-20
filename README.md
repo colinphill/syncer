@@ -30,6 +30,19 @@ Boost.Asio provides the synchronous TCP and Android local-socket transports. Boo
 
 Requirements are CMake 3.22+, a C++20 compiler, Ninja (on macOS and Linux), an Android NDK supporting API 26, and Android platform-tools. Set `ANDROID_NDK_HOME` to the NDK directory when building the Android server. Boost 1.81+ may be installed locally; otherwise CMake fetches the pinned source release.
 
+The managed client additionally requires the .NET 10 SDK:
+
+```powershell
+dotnet restore managed/Syncer.Managed.slnx
+dotnet build managed/Syncer.Managed.slnx --configuration Release --no-restore
+dotnet test managed/Syncer.Managed.slnx --configuration Release --no-build --no-restore
+scripts/build-managed-packages.ps1
+```
+
+The last command expects the native packaging script to have produced all four Android servers. It
+creates `Syncer.Client.0.2.0.nupkg` and the `Syncer.Tool` package under `out/package/nuget`. The tool
+installs as `syncer-managed`; it intentionally does not replace the native `syncer` command.
+
 Windows:
 
 ```powershell
@@ -116,3 +129,4 @@ schema-versioned result or error object; progress goes to stderr.
 Before applying or dry-running a push, the client prints every selected change and the comparison reason to the progress stream. Reasons distinguish missing paths, type replacements, size or modification-time differences, and destination-only deletions. With `--json`, these explanations remain on stderr so stdout stays valid JSON.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for details and [docs/PLAN.md](docs/PLAN.md) for the saved implementation plan.
+The complete protocol-6 wire contract is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).

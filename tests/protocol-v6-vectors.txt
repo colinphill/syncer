@@ -1,0 +1,4 @@
+# Cross-language protocol 6 golden vectors. Hex values use lowercase ASCII.
+header_scan_request_42_payload_010203=53594e43000600040000002a00000003
+manifest_folder_file=0000000f666f6c6465722f66696c652e62696e010000000100000002ffffffffffffff85
+plan_digest_reference=a68de765caab2b3a2c00f51f5b76ee3c39f416697b11631b64f5dfdb64c72525

@@ -37,6 +37,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
 
@@ -49,6 +54,12 @@ jobs:
       - name: Run client
         run: ./out/build/${{ matrix.preset }}/syncer version
 
+      - name: Build and test managed client
+        run: |
+          dotnet restore managed/Syncer.Managed.slnx
+          dotnet build managed/Syncer.Managed.slnx --configuration Release --no-restore
+          dotnet test managed/Syncer.Managed.slnx --configuration Release --no-build --no-restore
+
   build-and-test:
     name: Windows and Android
     runs-on: windows-2022
@@ -57,6 +68,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
 
       - name: Select Android NDK
         shell: pwsh
@@ -100,3 +116,21 @@ jobs:
           }
           & ./out/package/syncer-Release/syncer.exe version
           if ($LASTEXITCODE -ne 0) { throw "Packaged client failed with exit code $LASTEXITCODE." }
+
+      - name: Build and test managed client
+        shell: pwsh
+        run: |
+          dotnet restore managed/Syncer.Managed.slnx
+          dotnet build managed/Syncer.Managed.slnx --configuration Release --no-restore
+          dotnet test managed/Syncer.Managed.slnx --configuration Release --no-build --no-restore
+
+      - name: Pack and verify managed packages
+        shell: pwsh
+        run: |
+          ./scripts/build-managed-packages.ps1 -Configuration Release
+          $env:SYNCER_REQUIRE_EMBEDDED_SERVERS = '1'
+          dotnet test managed/tests/Syncer.Client.Tests/Syncer.Client.Tests.csproj --configuration Release --no-restore -p:SyncerServerRoot="$PWD/out/package/syncer-Release/servers" --filter EmbeddedServerSetIsCompleteWhenPresent
+          $toolPath = Join-Path $PWD 'out/tool-test'
+          dotnet tool install Syncer.Tool --tool-path $toolPath --version 0.2.0 --add-source "$PWD/out/package/nuget" --no-cache
+          & (Join-Path $toolPath 'syncer-managed.exe') version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged managed tool failed with exit code $LASTEXITCODE." }
