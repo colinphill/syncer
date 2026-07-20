@@ -27,7 +27,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <stop_token>
 #include <thread>
 
 #ifdef _WIN32
@@ -169,9 +168,14 @@ class CancellationState {
 public:
     explicit CancellationState(bool enabled) : shared_(std::make_shared<Shared>()) {
         if (enabled)
-            monitor_ = std::jthread([shared = shared_](std::stop_token stop) {
-                monitor_stdin(stop, shared);
+            monitor_ = std::thread([shared = shared_] {
+                monitor_stdin(shared);
             });
+    }
+
+    ~CancellationState() {
+        shared_->stop_requested.store(true);
+        if (monitor_.joinable()) monitor_.join();
     }
 
     void attach(ClientSession& session) {
@@ -194,6 +198,7 @@ public:
 private:
     struct Shared {
         std::atomic<bool> cancelled{};
+        std::atomic<bool> stop_requested{};
         std::mutex mutex;
         ClientSession* session{};
     };
@@ -220,14 +225,14 @@ private:
         return false;
     }
 
-    static void monitor_stdin(std::stop_token stop, const std::shared_ptr<Shared>& shared) {
+    static void monitor_stdin(const std::shared_ptr<Shared>& shared) {
         std::string pending;
         std::array<char, 128> buffer{};
 #ifdef _WIN32
         const HANDLE input = ::GetStdHandle(STD_INPUT_HANDLE);
         if (input == nullptr || input == INVALID_HANDLE_VALUE || ::GetFileType(input) != FILE_TYPE_PIPE)
             return;
-        while (!stop.stop_requested()) {
+        while (!shared->stop_requested.load()) {
             DWORD available{};
             if (!::PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) return;
             if (available == 0) {
@@ -240,7 +245,7 @@ private:
             if (consume(pending, buffer.data(), read, shared)) return;
         }
 #else
-        while (!stop.stop_requested()) {
+        while (!shared->stop_requested.load()) {
             pollfd descriptor{STDIN_FILENO, POLLIN, 0};
             const int ready = ::poll(&descriptor, 1, 50);
             if (ready < 0) return;
@@ -257,7 +262,7 @@ private:
     }
 
     std::shared_ptr<Shared> shared_;
-    std::jthread monitor_;
+    std::thread monitor_;
 };
 
 template <typename Action>
