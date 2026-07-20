@@ -1,3 +1,5 @@
+using System.IO.Enumeration;
+
 namespace Syncer;
 
 internal static class SourceScanner
@@ -18,12 +20,12 @@ internal static class SourceScanner
         try { root = Path.GetFullPath(requestedRoot); if (!Directory.Exists(root)) throw new IOException(); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         { throw new SyncerException(SyncerErrorCode.Safety, "source must be an accessible directory", error); }
-        var manifest = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
-        var files = new Dictionary<string, SourceFile>(StringComparer.Ordinal);
+        var manifest = new Dictionary<string, ManifestEntry>(4096, StringComparer.Ordinal);
+        var files = new Dictionary<string, SourceFile>(4096, StringComparer.Ordinal);
         var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
         var ancestors = new HashSet<string>(comparer);
 
-        void Walk(FileSystemInfo input, string logical, bool isRoot)
+        void Walk(ScanEntry input, string logical, bool isRoot)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!isRoot)
@@ -32,25 +34,37 @@ internal static class SourceScanner
                     throw new SyncerException(SyncerErrorCode.Safety, "source contains the reserved top-level .syncer path");
                 if (exclusions.MatchesExact(logical)) return;
             }
-            FileSystemInfo effective = input;
+            string physical = input.FullPath;
+            var attributes = input.Attributes;
+            ulong size = input.Size;
+            DateTime modifiedUtc = input.ModifiedUtc;
             try
             {
-                if ((input.Attributes & FileAttributes.ReparsePoint) != 0 &&
-                    ShouldResolveReparsePoint(input.FullName))
-                    effective = input.ResolveLinkTarget(true) ?? throw new IOException();
-                effective.Refresh();
+                if ((attributes & FileAttributes.ReparsePoint) != 0 &&
+                    ShouldResolveReparsePoint(physical))
+                {
+                    FileSystemInfo link = (attributes & FileAttributes.Directory) != 0
+                        ? new DirectoryInfo(physical)
+                        : new FileInfo(physical);
+                    FileSystemInfo effective = link.ResolveLinkTarget(true) ?? throw new IOException();
+                    effective.Refresh();
+                    physical = effective.FullName;
+                    attributes = effective.Attributes;
+                    size = effective is FileInfo file ? checked((ulong)file.Length) : 0;
+                    modifiedUtc = effective.LastWriteTimeUtc;
+                }
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-            { throw new SyncerException(SyncerErrorCode.Safety, $"source contains a broken symbolic link: {input.FullName}", error); }
+            { throw new SyncerException(SyncerErrorCode.Safety, $"source contains a broken symbolic link: {input.FullPath}", error); }
 
-            if ((effective.Attributes & FileAttributes.Directory) != 0)
+            if ((attributes & FileAttributes.Directory) != 0)
             {
-                var identity = Path.GetFullPath(effective.FullName).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var identity = Path.GetFullPath(physical).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 if (!ancestors.Add(identity)) throw new SyncerException(SyncerErrorCode.Safety, $"source contains a recursive symbolic link or junction at: {logical}");
                 if (!isRoot) manifest.Add(logical, new(logical, EntryType.Directory, 0, 0));
                 try
                 {
-                    foreach (var child in new DirectoryInfo(effective.FullName).EnumerateFileSystemInfos())
+                    foreach (var child in Enumerate(physical))
                     {
                         var name = child.Name; var childLogical = logical.Length == 0 ? name : logical + "/" + name;
                         Walk(child, childLogical, false);
@@ -58,19 +72,47 @@ internal static class SourceScanner
                 }
                 catch (SyncerException) { throw; }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-                { throw new SyncerException(SyncerErrorCode.Safety, $"cannot enumerate source directory: {effective.FullName}", error); }
+                { throw new SyncerException(SyncerErrorCode.Safety, $"cannot enumerate source directory: {physical}", error); }
                 finally { ancestors.Remove(identity); }
             }
-            else if (effective is FileInfo file && file.Exists)
+            else
             {
-                var entry = new ManifestEntry(logical, EntryType.File, checked((ulong)file.Length), new DateTimeOffset(file.LastWriteTimeUtc).ToUnixTimeSeconds());
-                manifest.Add(logical, entry); files.Add(logical, new(entry, effective.FullName));
+                var entry = new ManifestEntry(logical, EntryType.File, size, new DateTimeOffset(modifiedUtc).ToUnixTimeSeconds());
+                manifest.Add(logical, entry); files.Add(logical, new(entry, physical));
             }
-            else throw new SyncerException(SyncerErrorCode.Safety, $"source contains an unsupported file type: {logical}");
         }
-        Walk(new DirectoryInfo(root), string.Empty, true);
+
+        var rootInfo = new DirectoryInfo(root);
+        try { rootInfo.Refresh(); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SyncerException(SyncerErrorCode.Safety, "source must be an accessible directory", error); }
+        Walk(new(rootInfo.FullName, rootInfo.Name, rootInfo.Attributes, 0, rootInfo.LastWriteTimeUtc), string.Empty, true);
         return new SourceTree(manifest, files);
     }
+
+    private static FileSystemEnumerable<ScanEntry> Enumerate(string directory) =>
+        new(directory, TransformEntry, new EnumerationOptions
+        {
+            RecurseSubdirectories = false,
+            BufferSize = 64 * 1024,
+            IgnoreInaccessible = false,
+            AttributesToSkip = 0,
+        });
+
+    private static ScanEntry TransformEntry(ref FileSystemEntry entry)
+    {
+        var attributes = entry.Attributes;
+        return new(entry.ToFullPath(), entry.FileName.ToString(), attributes,
+            (attributes & FileAttributes.Directory) != 0 ? 0 : checked((ulong)entry.Length),
+            entry.LastWriteTimeUtc.UtcDateTime);
+    }
+
+    private readonly record struct ScanEntry(
+        string FullPath,
+        string Name,
+        FileAttributes Attributes,
+        ulong Size,
+        DateTime ModifiedUtc);
 
     // Windows exposes DFS/SMB namespace entries as reparse points. ResolveLinkTarget can turn
     // those UNC paths into malformed application-relative "UNC\server\share" paths; enumerating

@@ -43,7 +43,7 @@ internal sealed class ClientSession : IAsyncDisposable
     {
         var writer = new ProtocolWriter(); writer.WriteString(path); var request = NextRequest();
         await ProtocolCodec.SendAsync(stream, new(MessageType.Scan, request, writer.ToArray()), cancellationToken).ConfigureAwait(false);
-        var manifest = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
+        var manifest = new Dictionary<string, ManifestEntry>(4096, StringComparer.Ordinal);
         while (true)
         {
             var response = await ProtocolCodec.ReceiveAsync(stream, cancellationToken).ConfigureAwait(false); ThrowIfError(response);
@@ -55,6 +55,7 @@ internal sealed class ClientSession : IAsyncDisposable
             else if (response.Type == MessageType.ManifestBatch)
             {
                 var count = reader.ReadUInt32(); if (count > 100_000) throw new SyncerException(SyncerErrorCode.Transfer, "destination manifest batch entry count exceeds limit");
+                if (count <= int.MaxValue - manifest.Count) manifest.EnsureCapacity(manifest.Count + (int)count);
                 for (uint index = 0; index < count; ++index) Add(ProtocolCodec.ReadManifestEntry(ref reader));
             }
             else throw new SyncerException(SyncerErrorCode.Transfer, "invalid destination manifest response");

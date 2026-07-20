@@ -746,7 +746,7 @@ fs::path Server::destination_path(std::string_view relative, bool ensure_parents
 void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     require_root();
     constexpr std::size_t batch_limit = 512U * 1024U;
-    constexpr std::size_t worker_batch_entries = 256;
+    constexpr std::size_t worker_batch_entries = 1024;
     constexpr std::size_t queued_batch_limit = 8;
     std::vector<ManifestEntry> batch;
     std::size_t batch_bytes{};
@@ -825,25 +825,30 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
                     }
                     const std::string name(native->d_name);
                     if (name == "." || name == "..") continue;
+                    if (name.find('\\') != std::string::npos)
+                        throw Error(ExitCode::safety, "destination contains an invalid path");
                     const auto relative = task.relative.empty() ? name : task.relative + "/" + name;
                     if (task.relative.empty() && relative == kReservedDirectory) continue;
-                    if (!valid_relative_path(relative))
-                        throw Error(ExitCode::safety, "destination contains an invalid path");
+                    const bool known_directory = native->d_type == DT_DIR;
+                    const bool known_file = native->d_type == DT_REG;
                     struct stat value{};
-                    if (::fstatat(::dirfd(directory.get()), native->d_name, &value, AT_SYMLINK_NOFOLLOW) != 0)
+                    if ((known_file || native->d_type == DT_UNKNOWN) &&
+                        ::fstatat(::dirfd(directory.get()), native->d_name, &value, AT_SYMLINK_NOFOLLOW) != 0)
                         throw Error(ExitCode::transfer, "cannot inspect destination entry");
                     ManifestEntry entry;
                     entry.path = relative;
-                    entry.size = S_ISREG(value.st_mode) ? static_cast<std::uint64_t>(value.st_size) : 0;
-                    entry.modified_seconds = S_ISREG(value.st_mode) ?
-                        static_cast<std::int64_t>(value.st_mtim.tv_sec) : 0;
-                    if (S_ISREG(value.st_mode)) entry.type = EntryType::file;
-                    else if (S_ISDIR(value.st_mode)) entry.type = EntryType::directory;
-                    else entry.type = EntryType::other;
-                    const auto logical = logical_times_.find(relative);
-                    if (logical != logical_times_.end() && logical->second.type == entry.type &&
-                        (entry.type != EntryType::file || logical->second.size == entry.size))
-                        entry.modified_seconds = logical->second.modified_seconds;
+                    const bool is_file = (known_file || native->d_type == DT_UNKNOWN) && S_ISREG(value.st_mode);
+                    const bool is_directory = known_directory ||
+                        (native->d_type == DT_UNKNOWN && S_ISDIR(value.st_mode));
+                    entry.size = is_file ? static_cast<std::uint64_t>(value.st_size) : 0;
+                    entry.modified_seconds = is_file ? static_cast<std::int64_t>(value.st_mtim.tv_sec) : 0;
+                    entry.type = is_file ? EntryType::file : is_directory ? EntryType::directory : EntryType::other;
+                    if (is_file) {
+                        const auto logical = logical_times_.find(relative);
+                        if (logical != logical_times_.end() && logical->second.type == EntryType::file &&
+                            logical->second.size == entry.size)
+                            entry.modified_seconds = logical->second.modified_seconds;
+                    }
                     if (entry.type == EntryType::directory) {
                         std::lock_guard lock(mutex);
                         directories.push_back({task.physical / fs::path(name), relative, task.depth + 1});
@@ -870,7 +875,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     };
 
     const auto hardware_threads = std::thread::hardware_concurrency();
-    const auto worker_count = std::clamp(hardware_threads == 0 ? 4U : hardware_threads, 1U, 4U);
+    const auto worker_count = std::clamp(hardware_threads == 0 ? 4U : hardware_threads, 1U, 8U);
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
     try {
