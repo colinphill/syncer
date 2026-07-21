@@ -14,12 +14,15 @@ internal static class Tool
     {
         var root = new RootCommand("Mirror a host directory into managed Android shared storage over ADB.");
         root.Subcommands.Add(InitCommand()); root.Subcommands.Add(PushCommand()); root.Subcommands.Add(ApplyCommand());
-        root.Subcommands.Add(RestoreCommand()); root.Subcommands.Add(VersionCommand());
+        root.Subcommands.Add(RestoreCommand()); root.Subcommands.Add(DevicesCommand()); root.Subcommands.Add(VersionCommand());
         var parsed = root.Parse(args);
         if (parsed.Errors.Count != 0)
         {
             var message = string.Join("; ", parsed.Errors.Select(error => error.Message));
-            if (args.Contains("--json", StringComparer.Ordinal)) WriteJson(ErrorJson((int)SyncerErrorCode.Usage, message));
+            if (args.Contains("--json", StringComparer.Ordinal))
+                WriteJson(IsDevicesCommand(args)
+                    ? DevicesErrorJson((int)SyncerErrorCode.Usage, message)
+                    : ErrorJson((int)SyncerErrorCode.Usage, message));
             else foreach (var error in parsed.Errors) Console.Error.WriteLine($"syncer-managed: {error.Message}");
             return (int)SyncerErrorCode.Usage;
         }
@@ -110,32 +113,66 @@ internal static class Tool
         return command;
     }
 
+    private static Command DevicesCommand()
+    {
+        var adb = StringOption("--adb", "path to adb");
+        var json = Flag("--json", "write JSON result to stdout");
+        var command = new Command("devices", "List Android devices visible to ADB") { adb, json };
+        command.SetAction(parse => Execute(false, parse.GetValue(json), async token =>
+        {
+            var client = new SyncerClient(new() { AdbPath = parse.GetValue(adb) });
+            IReadOnlyList<SyncerDevice> devices = await client.EnumerateDevicesAsync(token);
+            if (parse.GetValue(json)) WriteJson(DevicesJson(devices));
+            else if (devices.Count == 0) Console.Out.WriteLine("No Android devices found.");
+            else
+            {
+                Console.Out.WriteLine("ID\tSERIAL\tSTATE\tCONNECTION\tNAME");
+                foreach (SyncerDevice device in devices)
+                    Console.Out.WriteLine($"{device.Id}\t{device.Serial}\t{device.State}\t{device.Connection}\t{device.DisplayName}");
+            }
+            return 0;
+        }, DevicesErrorJson));
+        return command;
+    }
+
     private static Command VersionCommand()
     {
         var command = new Command("version", "Display version information");
         command.SetAction(_ => { Console.Out.WriteLine($"syncer-managed {Version} (protocol 6)"); return 0; }); return command;
     }
 
-    private static int Execute(bool cancelStdin, bool json, Func<CancellationToken, Task<int>> action)
+    private static int Execute(
+        bool cancelStdin,
+        bool json,
+        Func<CancellationToken, Task<int>> action,
+        Func<int, string, JsonObject>? errorJson = null)
     {
         using var cancellation = new CancellationTokenSource();
         if (cancelStdin) _ = MonitorStdinAsync(cancellation);
         try { return action(cancellation.Token).GetAwaiter().GetResult(); }
-        catch (OperationCanceledException) { return Error(SyncerErrorCode.Cancelled, "synchronization cancelled", json); }
-        catch (ArgumentException error) { return Error(SyncerErrorCode.Usage, error.Message, json); }
-        catch (SyncerException error) { return Error(error.ErrorCode, error.Message, json); }
-        catch (Exception error) { return Error(SyncerErrorCode.Transfer, error.Message, json); }
+        catch (OperationCanceledException) { return Error(SyncerErrorCode.Cancelled, "synchronization cancelled", json, errorJson); }
+        catch (ArgumentException error) { return Error(SyncerErrorCode.Usage, error.Message, json, errorJson); }
+        catch (SyncerException error) { return Error(error.ErrorCode, error.Message, json, errorJson); }
+        catch (Exception error) { return Error(SyncerErrorCode.Transfer, error.Message, json, errorJson); }
     }
     private static async Task MonitorStdinAsync(CancellationTokenSource cancellation)
     {
         try { while (!cancellation.IsCancellationRequested && await Console.In.ReadLineAsync(cancellation.Token) is { } line) if (line == "cancel") { await cancellation.CancelAsync(); return; } }
         catch (OperationCanceledException) { }
     }
-    private static int Error(SyncerErrorCode code, string message, bool json)
+    private static int Error(
+        SyncerErrorCode code,
+        string message,
+        bool json,
+        Func<int, string, JsonObject>? errorJson = null)
     {
-        if (json) WriteJson(ErrorJson((int)code, message)); else Console.Error.WriteLine($"syncer-managed: {message}"); return (int)code;
+        if (json) WriteJson(errorJson?.Invoke((int)code, message) ?? ErrorJson((int)code, message));
+        else Console.Error.WriteLine($"syncer-managed: {message}");
+        return (int)code;
     }
     private static SyncerClient Client(ParseResult parse, Option<string?> adb, Option<string?> serial) => new(new() { AdbPath = parse.GetValue(adb), DeviceSerial = parse.GetValue(serial) });
+    private static bool IsDevicesCommand(string[] arguments) =>
+        arguments.Length != 0 && StringComparer.Ordinal.Equals(arguments[0], "devices");
     private static Option<string?> StringOption(string name, string description) => new(name) { Description = description };
     private static Option<bool> Flag(string name, string description) => new(name) { Description = description };
     private static Argument<string> RequiredArgument(string name, string description) => new(name) { Description = description };
@@ -184,6 +221,32 @@ internal static class Tool
         ["plan_digest"] = null, ["actions"] = new JsonArray(), ["plan_file"] = null, ["recovery_id"] = null, ["removal_count"] = 0,
         ["planned"] = CountsJson(new(0, 0, 0)), ["applied"] = CountsJson(new(0, 0, 0)), ["quarantined_count"] = 0,
         ["transferred_bytes"] = 0, ["duration_ms"] = 0, ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
+    };
+    internal static JsonObject DevicesJson(IEnumerable<SyncerDevice> devices) => new()
+    {
+        ["schema"] = 1,
+        ["status"] = "success",
+        ["devices"] = new JsonArray(devices.Select(device => (JsonNode)new JsonObject
+        {
+            ["id"] = device.Id,
+            ["serial"] = device.Serial,
+            ["display_name"] = device.DisplayName,
+            ["state"] = device.State,
+            ["ready"] = device.IsReady,
+            ["model"] = device.Model,
+            ["product"] = device.Product,
+            ["device"] = device.Device,
+            ["transport_id"] = device.TransportId,
+            ["connection"] = device.Connection,
+        }).ToArray()),
+        ["error"] = null,
+    };
+    internal static JsonObject DevicesErrorJson(int code, string message) => new()
+    {
+        ["schema"] = 1,
+        ["status"] = "error",
+        ["devices"] = new JsonArray(),
+        ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
     };
     private static JsonObject CountsJson(OperationCounts value) => new() { ["files"] = value.Files, ["directories"] = value.Directories, ["deletions"] = value.Deletions, ["bytes"] = value.Bytes };
     private static JsonArray ActionsJson(IEnumerable<PlannedChange> actions) => new(actions.Select(change => (JsonNode)new JsonObject

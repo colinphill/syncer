@@ -8,6 +8,11 @@ public sealed class SyncerClient
     private readonly SyncerClientOptions options;
     public SyncerClient(SyncerClientOptions? options = null) => this.options = options ?? new();
 
+    /// <summary>Enumerates every Android device currently reported by ADB.</summary>
+    public Task<IReadOnlyList<SyncerDevice>> EnumerateDevicesAsync(
+        CancellationToken cancellationToken = default) =>
+        AdbClient.EnumerateAsync(options, cancellationToken);
+
     public async Task<InitializeResult> InitializeAsync(
         string devicePath, InitializeOptions? initializeOptions = null,
         IProgress<SyncerProgress>? progress = null, CancellationToken cancellationToken = default)

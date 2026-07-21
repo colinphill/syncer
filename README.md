@@ -85,6 +85,7 @@ also be run manually to produce a downloadable workflow artifact without publish
 ## Usage
 
 ```text
+syncer devices [--adb PATH] [--json]
 syncer init [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--adopt] DEVICE_PATH
 syncer push [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--max-removals COUNT] [--expect-plan DIGEST] [--save-plan FILE] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH
 syncer apply [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--json] --plan FILE
@@ -100,6 +101,7 @@ syncer restore --recovery RECOVERY_ID /sdcard/MyMirror
 syncer push --exclude "**/*.tmp" C:\work\assets /sdcard/MyMirror
 syncer push --mtime-tolerance 0 C:\work\assets /sdcard/MyMirror
 syncer push --direct C:\Music music
+syncer devices --json
 syncer init music
 syncer push C:\Music music
 ```
@@ -126,6 +128,11 @@ cancel an operation.
 As a convenience, `music` may be used instead of an absolute `DEVICE_PATH`. It searches mounted removable storage volumes under `/storage/<volume-id>` for a top-level folder named `music`, case-insensitively; it never selects internal emulated storage. `init music` creates `Music` when exactly one removable volume is mounted and no matching folder exists. Multiple removable volumes require an absolute path, and other relative device paths are rejected.
 
 ADB is found from `--adb`, `ANDROID_HOME`/`ANDROID_SDK_ROOT`, Android Studio's default SDK directory for the host platform, or `PATH`. If multiple devices are ready, select one with `--serial` or `ANDROID_SERIAL`.
+
+`syncer devices` lists every row reported by `adb devices -l`, including devices that are offline or
+unauthorized so callers can explain why they cannot be selected. Machine output includes the raw ADB
+serial used by `--serial`, connection state and kind, model metadata, and a stable `id` formed from the
+raw model name and serial. Enumeration is host-only and does not deploy or start the Android server.
 
 Exit codes are `0` success, `2` usage, `3` ADB/device, `4` safety/preflight, `5` protocol/transfer,
 `6` source changed during transfer, and `7` cancelled. With `--json`, stdout contains one

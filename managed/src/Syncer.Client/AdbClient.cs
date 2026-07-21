@@ -17,12 +17,30 @@ internal sealed class AdbClient
             if (state.ExitCode != 0 || LastLine(state.Output) != "device") throw new SyncerException(SyncerErrorCode.Adb, $"selected ADB device is not ready: {requested}");
             return new(executable, requested, servers);
         }
-        var result = await ProcessRunner.RunAsync(executable, ["devices"], cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0) throw new SyncerException(SyncerErrorCode.Adb, $"adb devices failed: {result.Output.Trim()}");
-        var devices = AdbOutput.ReadyDevices(result.Output);
+        var devices = (await EnumerateAsync(executable, cancellationToken).ConfigureAwait(false))
+            .Where(device => device.IsReady).Select(device => device.Serial).ToArray();
         if (devices.Length == 0) throw new SyncerException(SyncerErrorCode.Adb, "no ready ADB device was found");
         if (devices.Length != 1) throw new SyncerException(SyncerErrorCode.Adb, "multiple ADB devices are ready; select one with DeviceSerial");
         return new(executable, devices[0], servers);
+    }
+
+    public static Task<IReadOnlyList<SyncerDevice>> EnumerateAsync(
+        SyncerClientOptions options, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnumerateAsync(Locate(options.AdbPath), cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<SyncerDevice>> EnumerateAsync(
+        string executable, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = await ProcessRunner.RunAsync(
+            executable, ["devices", "-l"], cancellationToken).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+            throw new SyncerException(SyncerErrorCode.Adb,
+                $"adb devices failed: {result.Output.Trim()}");
+        return AdbOutput.Devices(result.Output);
     }
 
     public async Task<string> DeployServerAsync(CancellationToken cancellationToken)
@@ -104,8 +122,82 @@ internal sealed class AdbClient
 internal static class AdbOutput
 {
     private static readonly string[] SupportedAbis = ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"];
-    public static string[] ReadyDevices(string output) => output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
-        .Select(line => line.Split('\t')).Where(parts => parts.Length >= 2 && parts[1].Trim() == "device").Select(parts => parts[0]).ToArray();
+    private static readonly HashSet<string> DeviceStates = new(StringComparer.Ordinal)
+    {
+        "authorizing", "bootloader", "connecting", "detached", "device", "host",
+        "no permissions", "offline", "recovery", "rescue", "sideload", "unauthorized",
+        "unknown",
+    };
+    public static SyncerDevice[] Devices(string output) => output
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+        .Select(ParseDevice)
+        .Where(device => device is not null)
+        .Cast<SyncerDevice>()
+        .ToArray();
+    public static string[] ReadyDevices(string output) => Devices(output)
+        .Where(device => device.IsReady).Select(device => device.Serial).ToArray();
     public static string? SelectAbi(string reported) => reported.Split(',').FirstOrDefault(value => SupportedAbis.Contains(value, StringComparer.Ordinal));
     public static bool TryParsePort(string value, out int port) => int.TryParse(value, out port) && port is > 0 and <= 65535;
+
+    private static SyncerDevice? ParseDevice(string input)
+    {
+        string line = input.Trim();
+        if (line.Length == 0 || line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase) ||
+            line.StartsWith('*')) return null;
+
+        // Current Windows platform-tools use a fixed-width, space-padded serial column,
+        // while older releases use a tab. Validate the following token as an ADB state
+        // so daemon diagnostics cannot become phantom devices.
+        int separator = line.IndexOfAny(['\t', ' ']);
+        if (separator <= 0) return null;
+        string serial = line[..separator];
+        string details = line[(separator + 1)..].TrimStart();
+        if (details.Length == 0) return null;
+
+        string state;
+        string metadata;
+        if (details.StartsWith("no permissions", StringComparison.Ordinal))
+        {
+            state = "no permissions";
+            metadata = details["no permissions".Length..];
+        }
+        else
+        {
+            int stateEnd = details.IndexOfAny(['\t', ' ']);
+            state = stateEnd < 0 ? details : details[..stateEnd];
+            metadata = stateEnd < 0 ? string.Empty : details[(stateEnd + 1)..];
+        }
+        if (!DeviceStates.Contains(state)) return null;
+
+        string? model = Metadata(metadata, "model");
+        string? product = Metadata(metadata, "product");
+        string? device = Metadata(metadata, "device");
+        string? transportId = Metadata(metadata, "transport_id");
+        string? friendly = model ?? product ?? device;
+        string displayName = friendly is null
+            ? serial
+            : $"{friendly.Replace('_', ' ')} ({serial})";
+        string id = $"{model ?? "unknown"}|{serial}";
+        string connection = Metadata(metadata, "usb") is not null
+            ? "usb"
+            : serial.StartsWith("emulator-", StringComparison.Ordinal)
+                ? "emulator"
+                : serial.Contains(':', StringComparison.Ordinal)
+                    ? "network"
+                    : "unknown";
+        return new(id, serial, displayName, state, model, product, device, transportId, connection);
+    }
+
+    private static string? Metadata(string details, string name)
+    {
+        foreach (string part in details.Split(['\t', ' '],
+                     StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            int separator = part.IndexOf(':');
+            if (separator > 0 && part.AsSpan(0, separator).SequenceEqual(name) &&
+                separator + 1 < part.Length)
+                return part[(separator + 1)..];
+        }
+        return null;
+    }
 }

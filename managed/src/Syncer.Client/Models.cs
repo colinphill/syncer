@@ -26,6 +26,22 @@ public sealed record SyncerClientOptions
     public string? ServerDirectory { get; init; }
 }
 
+/// <summary>Describes an Android device reported by ADB.</summary>
+public sealed record SyncerDevice(
+    string Id,
+    string Serial,
+    string DisplayName,
+    string State,
+    string? Model = null,
+    string? Product = null,
+    string? Device = null,
+    string? TransportId = null,
+    string? Connection = null)
+{
+    /// <summary>Gets whether ADB reports the device as ready for synchronization.</summary>
+    public bool IsReady => StringComparer.Ordinal.Equals(State, "device");
+}
+
 public sealed record InitializeOptions
 {
     public bool Adopt { get; init; }

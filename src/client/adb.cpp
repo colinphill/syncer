@@ -60,11 +60,92 @@ std::string file_digest(const fs::path& path) {
     return digest_hex(hash.finalize());
 }
 
+std::string display_component(std::string value) {
+    std::replace(value.begin(), value.end(), '_', ' ');
+    return value;
+}
+
+std::string connection_kind(const AdbDevice& device) {
+    if (!device.usb.empty()) return "usb";
+    if (device.serial.starts_with("emulator-")) return "emulator";
+    if (device.serial.find(':') != std::string::npos) return "network";
+    return "unknown";
+}
+
+bool known_adb_state(std::string_view state) {
+    // Keep this aligned with the connection states printed by `adb devices`.
+    // Valid rows may be padded with spaces, so state validation is what keeps
+    // daemon diagnostics such as "adb server version ..." out of the result.
+    return state == "device" || state == "offline" || state == "unauthorized" ||
+           state == "authorizing" || state == "connecting" || state == "bootloader" ||
+           state == "recovery" || state == "rescue" || state == "sideload" ||
+           state == "host" || state == "detached" || state == "unknown";
+}
+
 } // namespace
+
+std::vector<AdbDevice> parse_adb_devices(std::string_view output) {
+    std::vector<AdbDevice> devices;
+    std::istringstream lines{std::string(output)};
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = trim(std::move(line));
+        if (line.empty() || line == "List of devices attached" || line.front() == '*') continue;
+
+        const auto serial_end = line.find_first_of(" \t");
+        if (serial_end == std::string::npos || serial_end == 0) continue;
+        AdbDevice result;
+        result.serial = line.substr(0, serial_end);
+        auto details = trim(line.substr(serial_end + 1));
+        if (details.empty()) continue;
+
+        std::string metadata;
+        if (details == "no permissions" || details.starts_with("no permissions ") ||
+            details.starts_with("no permissions\t")) {
+            result.state = "no permissions";
+            metadata = trim(details.substr(result.state.size()));
+        } else {
+            const auto state_end = details.find_first_of(" \t");
+            result.state = details.substr(0, state_end);
+            metadata = state_end == std::string::npos ? std::string{} : trim(details.substr(state_end + 1));
+            if (!known_adb_state(result.state)) continue;
+        }
+
+        std::istringstream fields(metadata);
+        std::string field;
+        while (fields >> field) {
+            const auto separator = field.find(':');
+            if (separator == std::string::npos || separator == 0) continue;
+            const auto name = field.substr(0, separator);
+            const auto value = field.substr(separator + 1);
+            if (name == "model") result.model = value;
+            else if (name == "product") result.product = value;
+            else if (name == "device") result.device = value;
+            else if (name == "transport_id") result.transport_id = value;
+            else if (name == "usb") result.usb = value;
+        }
+
+        result.connection = connection_kind(result);
+        result.id = (result.model.empty() ? "unknown" : result.model) + "|" + result.serial;
+        const auto& friendly = !result.model.empty() ? result.model :
+            (!result.product.empty() ? result.product : result.device);
+        result.display_name = friendly.empty() ? result.serial :
+            display_component(friendly) + " (" + result.serial + ")";
+        devices.push_back(std::move(result));
+    }
+    return devices;
+}
 
 Adb::Adb(std::optional<fs::path> requested_path, std::optional<std::string> requested_serial)
     : executable_(locate(requested_path)) {
     serial_ = select_serial(requested_serial);
+}
+
+std::vector<AdbDevice> Adb::enumerate(const std::optional<fs::path>& requested_path) {
+    const auto executable = locate(requested_path);
+    const auto result = run_process(executable, {"devices", "-l"});
+    if (result.exit_code != 0) throw Error(ExitCode::adb, "adb devices failed: " + trim(result.output));
+    return parse_adb_devices(result.output);
 }
 
 fs::path Adb::locate(const std::optional<fs::path>& requested) {
@@ -126,15 +207,11 @@ std::string Adb::select_serial(const std::optional<std::string>& requested) cons
         if (result.exit_code != 0 || last_line(result.output) != "device") throw Error(ExitCode::adb, "selected ADB device is not ready: " + *desired);
         return *desired;
     }
-    const auto result = run_process(executable_, {"devices"});
+    const auto result = run_process(executable_, {"devices", "-l"});
     if (result.exit_code != 0) throw Error(ExitCode::adb, "adb devices failed: " + trim(result.output));
     std::vector<std::string> devices;
-    std::istringstream lines(result.output);
-    std::string line;
-    while (std::getline(lines, line)) {
-        const auto tab = line.find('\t');
-        if (tab != line.npos && trim(line.substr(tab + 1)) == "device") devices.push_back(line.substr(0, tab));
-    }
+    for (const auto& device : parse_adb_devices(result.output))
+        if (device.ready()) devices.push_back(device.serial);
     if (devices.empty()) throw Error(ExitCode::adb, "no ready ADB device was found");
     if (devices.size() != 1) throw Error(ExitCode::adb, "multiple ADB devices are ready; select one with --serial");
     return devices.front();

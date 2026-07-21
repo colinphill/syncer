@@ -70,6 +70,7 @@ struct Options {
 void usage() {
     std::cout << "syncer " << kVersion << "\n\n"
               << "Usage:\n"
+              << "  syncer devices [--adb PATH] [--json]\n"
               << "  syncer init [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--adopt] DEVICE_PATH\n"
               << "  syncer push [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--exclude GLOB]... [--mtime-tolerance SECONDS] [--max-removals COUNT] [--expect-plan DIGEST] [--save-plan FILE] [--no-delete] [--direct] [--dry-run] [--json] LOCAL_SOURCE DEVICE_PATH\n"
               << "  syncer apply [--adb PATH] [--serial SERIAL] [--cancel-stdin] [--json] --plan FILE\n"
@@ -78,7 +79,7 @@ void usage() {
 }
 
 Options parse(const std::vector<std::string>& command_line) {
-    if (command_line.size() < 2) throw Error(ExitCode::usage, "missing command; use init, push, apply, restore, or version");
+    if (command_line.size() < 2) throw Error(ExitCode::usage, "missing command; use devices, init, push, apply, restore, or version");
     Options options;
     options.command = command_line[1];
     std::vector<std::string> arguments(command_line.begin() + 2, command_line.end());
@@ -86,7 +87,7 @@ Options parse(const std::vector<std::string>& command_line) {
         if (!arguments.empty()) throw Error(ExitCode::usage, "version takes no arguments");
         return options;
     }
-    if (options.command != "init" && options.command != "push" && options.command != "apply" &&
+    if (options.command != "devices" && options.command != "init" && options.command != "push" && options.command != "apply" &&
         options.command != "restore")
         throw Error(ExitCode::usage, "unknown command: " + options.command);
 
@@ -99,12 +100,18 @@ Options parse(const std::vector<std::string>& command_line) {
     po::options_description description("Options");
     description.add_options()
         ("help,h", po::bool_switch(&options.help), "show help")
-        ("adb", po::value<std::string>(&adb_path), "path to adb")
-        ("serial", po::value<std::string>(&serial), "ADB device serial")
-        ("cancel-stdin", po::bool_switch(&options.cancel_stdin),
-         "accept a line containing 'cancel' on stdin");
+        ("adb", po::value<std::string>(&adb_path), "path to adb");
+    if (options.command != "devices") {
+        description.add_options()
+            ("serial", po::value<std::string>(&serial), "ADB device serial")
+            ("cancel-stdin", po::bool_switch(&options.cancel_stdin),
+             "accept a line containing 'cancel' on stdin");
+    }
     po::positional_options_description positional;
-    if (options.command == "init") {
+    if (options.command == "devices") {
+        description.add_options()
+            ("json", po::bool_switch(&options.json), "write JSON result to stdout");
+    } else if (options.command == "init") {
         description.add_options()
             ("adopt", po::bool_switch(&options.adopt), "adopt a non-empty destination")
             ("device-path", po::value<std::vector<std::string>>(&options.positional), "Android destination path");
@@ -775,12 +782,46 @@ int execute_restore(const Options& options, CancellationState& cancellation) {
     return 0;
 }
 
+int execute_devices(const Options& options) {
+    const auto devices = Adb::enumerate(options.adb);
+    if (options.json) {
+        const auto metadata = [](const std::string& value) {
+            return value.empty() ? boost::json::value(nullptr) : boost::json::value(value);
+        };
+        boost::json::array items;
+        for (const auto& device : devices) {
+            items.emplace_back(boost::json::object{
+                {"id", device.id},
+                {"serial", device.serial},
+                {"display_name", device.display_name},
+                {"state", device.state},
+                {"ready", device.ready()},
+                {"model", metadata(device.model)},
+                {"product", metadata(device.product)},
+                {"device", metadata(device.device)},
+                {"transport_id", metadata(device.transport_id)},
+                {"connection", device.connection}});
+        }
+        std::cout << boost::json::serialize(boost::json::object{
+            {"schema", 1}, {"status", "success"}, {"devices", std::move(items)}, {"error", nullptr}}) << '\n';
+    } else if (devices.empty()) {
+        std::cout << "No Android devices found.\n";
+    } else {
+        std::cout << "ID\tSERIAL\tSTATE\tCONNECTION\tNAME\n";
+        for (const auto& device : devices)
+            std::cout << device.id << '\t' << device.serial << '\t' << device.state << '\t'
+                      << device.connection << '\t' << device.display_name << '\n';
+    }
+    return 0;
+}
+
 int execute(const Options& options, CancellationState& cancellation) {
     if (options.help) { usage(); return 0; }
     if (options.command == "version") {
         std::cout << "syncer " << kVersion << " (protocol " << kProtocolVersion << ")\n";
         return 0;
     }
+    if (options.command == "devices") return execute_devices(options);
     cancellation.throw_if_cancelled();
     if (options.command == "init") {
         if (options.positional.size() != 1) throw Error(ExitCode::usage, "init requires DEVICE_PATH");
@@ -920,7 +961,14 @@ std::string error_json(int code, std::string_view message) {
     return boost::json::serialize(result);
 }
 
+std::string devices_error_json(int code, std::string_view message) {
+    return boost::json::serialize(boost::json::object{
+        {"schema", 1}, {"status", "error"}, {"devices", boost::json::array{}},
+        {"error", boost::json::object{{"code", code}, {"message", message}}}});
+}
+
 int run(std::vector<std::string> command_line) {
+    const bool devices_command = command_line.size() > 1 && command_line[1] == "devices";
     const bool json = std::find(command_line.begin() + std::min<std::size_t>(1, command_line.size()),
                                 command_line.end(), "--json") != command_line.end();
     try {
@@ -931,11 +979,15 @@ int run(std::vector<std::string> command_line) {
         CancellationState cancellation(options.cancel_stdin);
         return execute(options, cancellation);
     } catch (const Error& error) {
-        if (json) std::cout << error_json(static_cast<int>(error.code()), error.what()) << '\n';
+        if (json) std::cout << (devices_command
+            ? devices_error_json(static_cast<int>(error.code()), error.what())
+            : error_json(static_cast<int>(error.code()), error.what())) << '\n';
         else std::cerr << "syncer: " << error.what() << '\n';
         return static_cast<int>(error.code());
     } catch (const std::exception& error) {
-        if (json) std::cout << error_json(static_cast<int>(ExitCode::transfer), error.what()) << '\n';
+        if (json) std::cout << (devices_command
+            ? devices_error_json(static_cast<int>(ExitCode::transfer), error.what())
+            : error_json(static_cast<int>(ExitCode::transfer), error.what())) << '\n';
         else std::cerr << "syncer: " << error.what() << '\n';
         return static_cast<int>(ExitCode::transfer);
     }

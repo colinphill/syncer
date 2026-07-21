@@ -27,9 +27,87 @@ public sealed class CoreTests
     [TestMethod]
     public void AdbOutputParsingMatchesNativeSelectionRules()
     {
-        CollectionAssert.AreEqual(new[] { "one" }, AdbOutput.ReadyDevices("List of devices attached\none\tdevice\ntwo\toffline\nthree\tdevice product:x\n"));
+        CollectionAssert.AreEqual(new[] { "one", "three" }, AdbOutput.ReadyDevices("List of devices attached\none\tdevice\ntwo\toffline\nthree\tdevice product:x\n"));
         Assert.AreEqual("x86_64", AdbOutput.SelectAbi("riscv64,x86_64,x86")); Assert.IsNull(AdbOutput.SelectAbi("riscv64"));
         Assert.IsTrue(AdbOutput.TryParsePort("54321", out var port)); Assert.AreEqual(54321, port); Assert.IsFalse(AdbOutput.TryParsePort("70000", out _));
+    }
+
+    [TestMethod]
+    public void AdbOutputEnumeratesAllStatesAndMetadata()
+    {
+        SyncerDevice[] devices = AdbOutput.Devices(
+            "* daemon started successfully\n" +
+            "List of devices attached\n" +
+            "R5CT123\tdevice product:husky_beta model:Pixel_8_Pro device:husky transport_id:4 usb:1-2\n" +
+            "emulator-5554\toffline product:sdk_phone model:Virtual_Device device:emu transport_id:7\n" +
+            "192.0.2.4:5555\tunauthorized transport_id:9\n" +
+            "USB123\tno permissions (missing udev rules)\n");
+
+        Assert.HasCount(4, devices);
+        Assert.AreEqual(new SyncerDevice(
+            "Pixel_8_Pro|R5CT123", "R5CT123", "Pixel 8 Pro (R5CT123)", "device", "Pixel_8_Pro",
+            "husky_beta", "husky", "4", "usb"), devices[0]);
+        Assert.IsTrue(devices[0].IsReady);
+        Assert.AreEqual("Virtual Device (emulator-5554)", devices[1].DisplayName);
+        Assert.AreEqual("emulator", devices[1].Connection);
+        Assert.IsFalse(devices[1].IsReady);
+        Assert.AreEqual("network", devices[2].Connection);
+        Assert.AreEqual("192.0.2.4:5555", devices[2].DisplayName);
+        Assert.AreEqual("unknown|192.0.2.4:5555", devices[2].Id);
+        Assert.AreEqual("192.0.2.4:5555", devices[2].Serial);
+        Assert.AreEqual("no permissions", devices[3].State);
+        Assert.AreEqual("unknown", devices[3].Connection);
+    }
+
+    [TestMethod]
+    public void AdbOutputRejectsSpaceDelimitedDiagnostics()
+    {
+        SyncerDevice[] devices = AdbOutput.Devices(
+            "List of devices attached\n" +
+            "adb server version does not match this client\n" +
+            "* daemon started successfully *\n" +
+            "SERIAL123              device product:husky model:Pixel_8 transport_id:4\n");
+
+        Assert.HasCount(1, devices);
+        Assert.AreEqual("SERIAL123", devices[0].Serial);
+        Assert.AreEqual("Pixel_8|SERIAL123", devices[0].Id);
+    }
+
+    [TestMethod]
+    public void AdbOutputParsesCurrentWindowsFixedWidthColumns()
+    {
+        const string output =
+            "List of devices attached\r\n" +
+            "?                      device product:bengal_515 model:FIIO_M33_R2R device:bengal_515 transport_id:33\r\n" +
+            "d                      device product:DX180 model:DX180 device:DX180 transport_id:32\r\n\r\n";
+
+        SyncerDevice[] devices = AdbOutput.Devices(output);
+
+        Assert.HasCount(2, devices);
+        Assert.AreEqual("FIIO_M33_R2R|?", devices[0].Id);
+        Assert.AreEqual("FIIO M33 R2R (?)", devices[0].DisplayName);
+        Assert.AreEqual("DX180|d", devices[1].Id);
+        Assert.IsTrue(devices.All(device => device.IsReady));
+    }
+
+    [TestMethod]
+    public void AdbOutputUsesProductThenDeviceAsFriendlyNameFallback()
+    {
+        SyncerDevice[] devices = AdbOutput.Devices(
+            "product-fallback\tdevice product:My_Tablet device:tablet\n" +
+            "device-fallback\trecovery device:rescue_target\n");
+
+        Assert.AreEqual("My Tablet (product-fallback)", devices[0].DisplayName);
+        Assert.AreEqual("unknown|product-fallback", devices[0].Id);
+        Assert.AreEqual("rescue target (device-fallback)", devices[1].DisplayName);
+    }
+
+    [TestMethod]
+    public async Task DeviceEnumerationHonorsPreCancelledTokenBeforeResolvingAdb()
+    {
+        var client = new SyncerClient(new() { AdbPath = "an intentionally missing adb executable" });
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
+            client.EnumerateDevicesAsync(new CancellationToken(canceled: true)));
     }
 
     [TestMethod]

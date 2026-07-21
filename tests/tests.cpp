@@ -6,6 +6,7 @@
 
 #include "scanner.hpp"
 #include "process.hpp"
+#include "adb.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -92,6 +93,60 @@ void test_globs() {
     CHECK(set.matches("build/deep/output.bin"));
     CHECK(set.matches("a/b/cache.tmp"));
     CHECK(!set.matches("a/b/cache.bin"));
+}
+
+void test_adb_device_enumeration() {
+    const auto devices = syncer::client::parse_adb_devices(
+        "* daemon started successfully *\r\n"
+        "List of devices attached\r\n"
+        "R58M1234                      device product:beyond1 model:SM_G973F device:beyond1 usb:1-2 transport_id:7\r\n"
+        "192.0.2.8:5555        device product:panther model:Pixel_7 device:panther transport_id:8\n"
+        "emulator-5554\toffline product:sdk_phone_x86 device:generic_x86 transport_id:9\n"
+        "UNAUTHORIZED\tunauthorized usb:3-4 transport_id:10\n"
+        "RECOVERY\trecovery product:recovery_product device:recovery_device\n"
+        "????????????            no permissions (missing udev rules)\n"
+        "adb server version (41) doesn't match this client (39); killing...\n"
+        "not-a-device            server diagnostic text\n"
+        "malformed\n");
+    CHECK(devices.size() == 6);
+
+    CHECK(devices[0].id == "SM_G973F|R58M1234");
+    CHECK(devices[0].serial == "R58M1234");
+    CHECK(devices[0].display_name == "SM G973F (R58M1234)");
+    CHECK(devices[0].state == "device");
+    CHECK(devices[0].ready());
+    CHECK(devices[0].connection == "usb");
+    CHECK(devices[0].model == "SM_G973F");
+    CHECK(devices[0].product == "beyond1");
+    CHECK(devices[0].device == "beyond1");
+    CHECK(devices[0].transport_id == "7");
+
+    CHECK(devices[1].id == "Pixel_7|192.0.2.8:5555");
+    CHECK(devices[1].serial == "192.0.2.8:5555");
+    CHECK(devices[1].display_name == "Pixel 7 (192.0.2.8:5555)");
+    CHECK(devices[1].connection == "network");
+    CHECK(devices[1].ready());
+
+    CHECK(devices[2].display_name == "sdk phone x86 (emulator-5554)");
+    CHECK(devices[2].state == "offline");
+    CHECK(devices[2].connection == "emulator");
+    CHECK(!devices[2].ready());
+
+    CHECK(devices[3].display_name == "UNAUTHORIZED");
+    CHECK(devices[3].id == "unknown|UNAUTHORIZED");
+    CHECK(devices[3].state == "unauthorized");
+    CHECK(devices[3].connection == "usb");
+
+    CHECK(devices[4].display_name == "recovery product (RECOVERY)");
+    CHECK(devices[4].state == "recovery");
+    CHECK(devices[4].connection == "unknown");
+    CHECK(!devices[4].ready());
+
+    CHECK(devices[5].id == "unknown|????????????");
+    CHECK(devices[5].state == "no permissions");
+    CHECK(devices[5].display_name == "????????????");
+
+    CHECK(syncer::client::parse_adb_devices("List of devices attached\n\n").empty());
 }
 
 void test_paths_and_plan() {
@@ -287,7 +342,7 @@ void test_processes() {
 
 int main() {
     try {
-        test_blake3(); test_globs(); test_paths_and_plan(); test_protocol();
+        test_blake3(); test_globs(); test_adb_device_enumeration(); test_paths_and_plan(); test_protocol();
         test_source_scan();
 #ifndef _WIN32
         test_processes();
