@@ -3,7 +3,6 @@
     <PackageId>Syncer.Client</PackageId>
     <Description>Managed client for the syncer Android directory synchronization protocol.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
