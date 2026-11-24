@@ -64,8 +64,8 @@ single `manifest_entry` is also accepted), followed by `manifest_end`, all with 
 
 `record_times` entries describe unchanged destination files by source path, size, and source time.
 The server first checks that every entry names an existing regular file of the stated size (otherwise
-it fails with exit category 6 and records nothing), then applies each time where the filesystem
-permits it and stores it in the timestamp catalog. Large collections are split across multiple
+it fails with exit category 6 and records nothing), then stores each time in the timestamp catalog.
+The destination files' own modification times are left unchanged. Large collections are split across multiple
 requests.
 
 ## Required sequences

@@ -723,14 +723,22 @@ void Server::save_metadata() {
     metadata_dirty_ = false;
 }
 
-fs::path Server::destination_path(std::string_view relative, bool ensure_parents) {
+fs::path Server::destination_path(std::string_view relative, bool ensure_parents,
+                                  std::unordered_set<std::string>* checked_parents) {
     require_root();
+    if (ensure_parents) checked_parents = nullptr;
     if (!valid_relative_path(relative) || relative == kReservedDirectory || relative.starts_with(std::string(kReservedDirectory) + "/"))
         throw Error(ExitCode::safety, "invalid destination-relative path");
     const fs::path relative_path(relative);
     fs::path current = root_;
+    std::string prefix;
     for (const auto& component : relative_path.parent_path()) {
         current /= component;
+        if (checked_parents) {
+            if (!prefix.empty()) prefix += '/';
+            prefix += component.string();
+            if (checked_parents->contains(prefix)) continue;
+        }
         std::error_code error;
         const auto status = fs::symlink_status(current, error);
         if (error && error != std::errc::no_such_file_or_directory) throw Error(ExitCode::safety, "cannot inspect destination parent");
@@ -740,6 +748,7 @@ fs::path Server::destination_path(std::string_view relative, bool ensure_parents
             fs::remove_all(current);
         }
         if (ensure_parents && !fs::exists(current)) fs::create_directory(current);
+        if (checked_parents) checked_parents->insert(prefix);
     }
     return root_ / relative_path;
 }
@@ -1099,24 +1108,26 @@ void Server::record_times(ByteReader& reader) {
     const auto count = reader.u32();
     if (count > kMaxFramePayload / (4U + 1U + 1U + 8U + 8U))
         throw Error(ExitCode::transfer, "timestamp record count exceeds limit");
-    std::vector<std::pair<ManifestEntry, fs::path>> records;
+    std::vector<ManifestEntry> records;
     records.reserve(count);
+    std::unordered_set<std::string> checked_parents;
     // Check every record before the first mutation so a destination that changed after the
-    // scan cannot leave a partially recorded batch.
+    // scan cannot leave a partially recorded batch. Each shared-storage call is slow on
+    // Android (FUSE, often over a dirsync exFAT card), so parents are inspected once per batch.
     for (std::uint32_t index = 0; index < count; ++index) {
         auto entry = decode_manifest_entry(reader);
         if (entry.type != EntryType::file) throw Error(ExitCode::transfer, "timestamp record must describe a file");
-        auto destination = destination_path(entry.path, false);
+        const auto destination = destination_path(entry.path, false, &checked_parents);
         struct stat value{};
         if (::lstat(destination.c_str(), &value) != 0 || !S_ISREG(value.st_mode) ||
             static_cast<std::uint64_t>(value.st_size) != entry.size)
             throw Error(ExitCode::source_changed, "destination changed after it was scanned: " + entry.path);
-        records.emplace_back(std::move(entry), std::move(destination));
+        records.push_back(std::move(entry));
     }
-    for (const auto& [entry, destination] : records) {
-        apply_mtime(destination, entry.modified_seconds);
+    // Only the catalog is updated. Scans prefer a size-matching catalog record, and on FAT or
+    // exFAT a file-system time would drift again at the next daylight-saving change anyway.
+    for (const auto& entry : records)
         logical_times_[entry.path] = LogicalTime{EntryType::file, entry.size, entry.modified_seconds};
-    }
     if (!records.empty()) metadata_dirty_ = true;
 }
 

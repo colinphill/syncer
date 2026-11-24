@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace syncer::server {
 
@@ -63,7 +64,10 @@ private:
     void record_times(ByteReader& reader);
 
     [[nodiscard]] std::filesystem::path validate_root(std::string_view requested, bool allow_missing) const;
-    [[nodiscard]] std::filesystem::path destination_path(std::string_view relative, bool ensure_parents);
+    // checked_parents (read-only lookups only) caches destination-relative parent directories that
+    // already passed inspection, so batches sharing folders inspect each folder once.
+    [[nodiscard]] std::filesystem::path destination_path(std::string_view relative, bool ensure_parents,
+                                                         std::unordered_set<std::string>* checked_parents = nullptr);
     void acquire_lock();
     void require_root() const;
     void load_metadata();
