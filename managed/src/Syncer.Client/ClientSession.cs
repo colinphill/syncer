@@ -39,29 +39,34 @@ internal sealed class ClientSession : IAsyncDisposable
     public Task InitializeAsync(string path, bool adopt, CancellationToken cancellationToken)
     { var writer = new ProtocolWriter(); writer.WriteString(path); writer.WriteByte(adopt ? (byte)1 : (byte)0); return OperationAsync(MessageType.Initialize, writer.ToArray(), cancellationToken); }
 
-    public async Task<IReadOnlyDictionary<string, ManifestEntry>> ScanAsync(string path, CancellationToken cancellationToken)
+    public async Task<DestinationManifest> ScanAsync(string path, CancellationToken cancellationToken)
     {
         var writer = new ProtocolWriter(); writer.WriteString(path); var request = NextRequest();
         await ProtocolCodec.SendAsync(stream, new(MessageType.Scan, request, writer.ToArray()), cancellationToken).ConfigureAwait(false);
         var manifest = new Dictionary<string, ManifestEntry>(4096, StringComparer.Ordinal);
+        var untracked = new HashSet<string>(StringComparer.Ordinal);
         while (true)
         {
             var response = await ProtocolCodec.ReceiveAsync(stream, cancellationToken).ConfigureAwait(false); ThrowIfError(response);
             if (response.RequestId != request) throw new SyncerException(SyncerErrorCode.Transfer, "destination manifest response has wrong request ID");
             if (response.Type == MessageType.ManifestEnd) break;
             var reader = new ProtocolReader(response.Payload);
-            void Add(ManifestEntry entry) { if (!manifest.TryAdd(entry.Path, entry)) throw new SyncerException(SyncerErrorCode.Transfer, "duplicate destination manifest path"); }
-            if (response.Type == MessageType.ManifestEntry) Add(ProtocolCodec.ReadManifestEntry(ref reader));
+            void Add((ManifestEntry Entry, byte Flags) scanned)
+            {
+                if (!manifest.TryAdd(scanned.Entry.Path, scanned.Entry)) throw new SyncerException(SyncerErrorCode.Transfer, "duplicate destination manifest path");
+                if ((scanned.Flags & ProtocolConstants.ScanEntryUntrackedTime) != 0) untracked.Add(scanned.Entry.Path);
+            }
+            if (response.Type == MessageType.ManifestEntry) Add(ProtocolCodec.ReadScanEntry(ref reader));
             else if (response.Type == MessageType.ManifestBatch)
             {
                 var count = reader.ReadUInt32(); if (count > 100_000) throw new SyncerException(SyncerErrorCode.Transfer, "destination manifest batch entry count exceeds limit");
                 if (count <= int.MaxValue - manifest.Count) manifest.EnsureCapacity(manifest.Count + (int)count);
-                for (uint index = 0; index < count; ++index) Add(ProtocolCodec.ReadManifestEntry(ref reader));
+                for (uint index = 0; index < count; ++index) Add(ProtocolCodec.ReadScanEntry(ref reader));
             }
             else throw new SyncerException(SyncerErrorCode.Transfer, "invalid destination manifest response");
             reader.RequireEnd();
         }
-        return manifest;
+        return new(manifest, untracked);
     }
 
     public Task SelectRootAsync(string path, CancellationToken cancellationToken)
@@ -97,6 +102,25 @@ internal sealed class ClientSession : IAsyncDisposable
                 if (value.Exists) ProtocolCodec.WriteManifestEntry(writer, value.Entry!);
             }
             await OperationAsync(MessageType.ValidatePlan, writer.ToArray(), cancellationToken).ConfigureAwait(false); begin = end;
+        }
+    }
+
+    public async Task RecordTimesAsync(IReadOnlyList<PlannedChange> records, CancellationToken cancellationToken)
+    {
+        var begin = 0;
+        while (begin < records.Count)
+        {
+            var end = begin; var encodedSize = 4;
+            while (end < records.Count)
+            {
+                var next = 4 + ProtocolWriter.Utf8.GetByteCount(records[end].Path) + 1 + 8 + 8;
+                if (end != begin && encodedSize + next > ProtocolConstants.MaximumPayload - 1024) break;
+                if (encodedSize + next > ProtocolConstants.MaximumPayload) throw new SyncerException(SyncerErrorCode.Safety, "timestamp record has an oversized destination path");
+                encodedSize += next; end++;
+            }
+            var writer = new ProtocolWriter(); writer.WriteUInt32(checked((uint)(end - begin)));
+            for (var index = begin; index < end; ++index) ProtocolCodec.WriteManifestEntry(writer, records[index].Entry);
+            await OperationAsync(MessageType.RecordTimes, writer.ToArray(), cancellationToken).ConfigureAwait(false); begin = end;
         }
     }
 

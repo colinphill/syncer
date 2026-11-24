@@ -34,7 +34,7 @@ target_include_directories(syncer_core PUBLIC include)
 target_link_libraries(syncer_core PUBLIC Boost::headers Boost::asio Boost::uuid)
 target_compile_definitions(syncer_core PUBLIC
     SYNCER_VERSION="${PROJECT_VERSION}"
-    SYNCER_PROTOCOL_VERSION=6)
+    SYNCER_PROTOCOL_VERSION=7)
 
 if(MSVC)
     target_compile_options(syncer_core PRIVATE /W4 /permissive- /EHsc)

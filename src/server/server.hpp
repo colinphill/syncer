@@ -60,6 +60,7 @@ private:
     void commit_file(ByteReader& reader);
     void delete_path(ByteReader& reader);
     void set_mtime(ByteReader& reader);
+    void record_times(ByteReader& reader);
 
     [[nodiscard]] std::filesystem::path validate_root(std::string_view requested, bool allow_missing) const;
     [[nodiscard]] std::filesystem::path destination_path(std::string_view relative, bool ensure_parents);

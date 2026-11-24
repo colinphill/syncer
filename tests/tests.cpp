@@ -25,7 +25,7 @@ namespace {
 int failures{};
 
 std::map<std::string, std::string> protocol_vectors() {
-    std::ifstream input(std::filesystem::path(SYNCER_TEST_SOURCE_DIR) / "tests" / "protocol-v6-vectors.txt");
+    std::ifstream input(std::filesystem::path(SYNCER_TEST_SOURCE_DIR) / "tests" / "protocol-v7-vectors.txt");
     std::map<std::string, std::string> values;
     std::string line;
     while (std::getline(input, line)) {
@@ -219,6 +219,68 @@ void test_paths_and_plan() {
     CHECK(ordered.deletions[0].entry.path == "old/deep.bin");
     CHECK(ordered.deletions[1].entry.path == "old");
     CHECK(syncer::make_plan(ordered_source, ordered_destination, syncer::GlobSet{}, false).deletions.empty());
+    CHECK(plan.timestamps.empty());
+}
+
+void test_untracked_destination_times() {
+    syncer::Manifest source, destination;
+    syncer::PathSet untracked;
+    const auto add = [&](const std::string& path, std::uint64_t size, std::int64_t time,
+                         std::uint64_t destination_size, std::int64_t destination_time, bool is_untracked) {
+        source.emplace(path, syncer::ManifestEntry{path, syncer::EntryType::file, size, time});
+        destination.emplace(path, syncer::ManifestEntry{path, syncer::EntryType::file, destination_size, destination_time});
+        if (is_untracked) untracked.insert(path);
+    };
+    const std::int64_t base = 1700000000;
+    add("tracked-same.flac", 10, base, 10, base, false);
+    add("untracked-same.flac", 10, base, 10, base, true);
+    add("untracked-near.flac", 10, base, 10, base + 30, true);
+    add("untracked-shift-ahead.flac", 10, base, 10, base + 3600, true);
+    add("untracked-shift-behind.flac", 10, base, 10, base - 3630, true);
+    add("tracked-shift.flac", 10, base, 10, base + 3600, false);
+    add("untracked-two-hours.flac", 10, base, 10, base + 7200, true);
+    add("untracked-shift-resized.flac", 10, base, 11, base + 3600, true);
+    destination.emplace("untracked-extra.flac", syncer::ManifestEntry{"untracked-extra.flac", syncer::EntryType::file, 1, 1});
+    untracked.insert("untracked-extra.flac");
+
+    const auto plan = syncer::make_plan(source, destination, syncer::GlobSet{}, true, 60, untracked);
+    CHECK(plan.timestamps.size() == 4);
+    if (plan.timestamps.size() == 4) {
+        CHECK(plan.timestamps[0].entry.path == "untracked-near.flac");
+        CHECK(plan.timestamps[1].entry.path == "untracked-same.flac");
+        CHECK(plan.timestamps[2].entry.path == "untracked-shift-ahead.flac");
+        CHECK(plan.timestamps[3].entry.path == "untracked-shift-behind.flac");
+        for (const auto& record : plan.timestamps) {
+            CHECK(record.action == syncer::PlanAction::record_timestamp);
+            CHECK(record.entry.modified_seconds == base);
+        }
+        CHECK(plan.timestamps[0].reason == "destination modification time is not recorded in the timestamp catalog");
+        CHECK(plan.timestamps[2].reason ==
+              "destination modification time differs by 3600 seconds (source 1700000000, destination 1700003600), "
+              "matching a one-hour daylight-saving shift within the tolerance of 60 seconds");
+        CHECK(plan.timestamps[3].reason.find("differs by 3630 seconds") != std::string::npos);
+    }
+    CHECK(plan.files.size() == 3);
+    if (plan.files.size() == 3) {
+        CHECK(plan.files[0].entry.path == "tracked-shift.flac");
+        CHECK(plan.files[1].entry.path == "untracked-shift-resized.flac");
+        CHECK(plan.files[2].entry.path == "untracked-two-hours.flac");
+        for (const auto& change : plan.files) CHECK(change.action == syncer::PlanAction::update_file);
+    }
+    CHECK(plan.transfer_bytes == 30);
+    CHECK(plan.deletions.size() == 1);
+
+    syncer::Manifest exact_source, exact_destination;
+    exact_source.emplace("exact.flac", syncer::ManifestEntry{"exact.flac", syncer::EntryType::file, 1, base});
+    exact_source.emplace("off.flac", syncer::ManifestEntry{"off.flac", syncer::EntryType::file, 1, base});
+    exact_destination.emplace("exact.flac", syncer::ManifestEntry{"exact.flac", syncer::EntryType::file, 1, base - 3600});
+    exact_destination.emplace("off.flac", syncer::ManifestEntry{"off.flac", syncer::EntryType::file, 1, base + 3601});
+    const auto exact = syncer::make_plan(exact_source, exact_destination, syncer::GlobSet{}, true, 0,
+                                         syncer::PathSet{"exact.flac", "off.flac"});
+    CHECK(exact.timestamps.size() == 1);
+    CHECK(!exact.timestamps.empty() && exact.timestamps[0].entry.path == "exact.flac");
+    CHECK(exact.files.size() == 1);
+    CHECK(!exact.files.empty() && exact.files[0].entry.path == "off.flac");
 }
 
 void test_protocol() {
@@ -238,6 +300,28 @@ void test_protocol() {
     syncer::Frame frame{syncer::MessageType::scan, 42, {1, 2, 3}};
     const auto header = syncer::encode_header(frame);
     CHECK(bytes_hex(header) == vectors.at("header_scan_request_42_payload_010203"));
+
+    syncer::ByteWriter scan_writer;
+    syncer::encode_scan_entry(scan_writer, {original, syncer::kScanEntryUntrackedTime});
+    const auto scan_payload = std::move(scan_writer).take();
+    CHECK(bytes_hex(scan_payload) == vectors.at("scan_entry_folder_file_untracked"));
+    syncer::ByteReader scan_reader(scan_payload);
+    const auto scanned = syncer::decode_scan_entry(scan_reader);
+    scan_reader.require_end();
+    CHECK(scanned.entry == original);
+    CHECK(scanned.flags == syncer::kScanEntryUntrackedTime);
+    const auto invalid_scan_entry = [](syncer::EntryType type, std::uint8_t flags) {
+        return throws_syncer_error([=] {
+            syncer::ByteWriter invalid;
+            syncer::encode_scan_entry(invalid, {{"entry", type, 0, 0}, flags});
+            const auto bytes = std::move(invalid).take();
+            syncer::ByteReader invalid_reader(bytes);
+            (void)syncer::decode_scan_entry(invalid_reader);
+        });
+    };
+    CHECK(invalid_scan_entry(syncer::EntryType::file, 0x02U));
+    CHECK(invalid_scan_entry(syncer::EntryType::directory, syncer::kScanEntryUntrackedTime));
+    CHECK(!invalid_scan_entry(syncer::EntryType::directory, 0));
     std::array<std::uint8_t, 16> fixed{};
     std::copy(header.begin(), header.end(), fixed.begin());
     const auto decoded_frame = syncer::decode_frame_header(fixed);
@@ -277,7 +361,7 @@ void test_protocol() {
     }));
 
     syncer::ByteWriter plan_writer;
-    plan_writer.string("SYNCER-PLAN"); plan_writer.u32(1);
+    plan_writer.string("SYNCER-PLAN"); plan_writer.u32(2);
     plan_writer.string("source"); plan_writer.string("/sdcard/target"); plan_writer.string("serial");
     plan_writer.u8(0); plan_writer.u8(1); plan_writer.i64(0);
     plan_writer.u32(1); plan_writer.string("**/*.tmp");
@@ -286,9 +370,14 @@ void test_protocol() {
     syncer::encode_manifest_entry(plan_writer, {"a.txt", syncer::EntryType::file, 3, 42});
     plan_writer.string("destination path is missing");
     plan_writer.u32(0);
+    plan_writer.u32(1); plan_writer.u8(static_cast<std::uint8_t>(syncer::PlanAction::record_timestamp));
+    syncer::encode_manifest_entry(plan_writer, {"b.txt", syncer::EntryType::file, 5, 43});
+    plan_writer.string("destination modification time is not recorded in the timestamp catalog");
     const auto plan_bytes = std::move(plan_writer).take();
     syncer::Blake3 plan_hash; plan_hash.update(plan_bytes);
-    CHECK(syncer::digest_hex(plan_hash.finalize()) == vectors.at("plan_digest_reference"));
+    const auto plan_digest = syncer::digest_hex(plan_hash.finalize());
+    CHECK(plan_digest == vectors.at("plan_digest_reference"));
+    if (plan_digest != vectors.at("plan_digest_reference")) std::cerr << "plan digest: " << plan_digest << '\n';
 }
 
 void test_source_scan() {
@@ -342,7 +431,8 @@ void test_processes() {
 
 int main() {
     try {
-        test_blake3(); test_globs(); test_adb_device_enumeration(); test_paths_and_plan(); test_protocol();
+        test_blake3(); test_globs(); test_adb_device_enumeration(); test_paths_and_plan();
+        test_untracked_destination_times(); test_protocol();
         test_source_scan();
 #ifndef _WIN32
         test_processes();

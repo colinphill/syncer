@@ -6,29 +6,29 @@ namespace Syncer;
 
 internal static class SavedPlans
 {
-    private const int Schema = 1;
+    private const int Schema = 2;
 
     public static SyncPlan Create(
         string source, string destination, string serial, PushOptions options,
         PlanParts parts, ulong removals, IReadOnlyDictionary<string, SourceFile> sourceFiles,
         IReadOnlyList<DestinationPrecondition> preconditions)
     {
-        var digest = ComputeDigest(source, destination, serial, options, parts.Directories, parts.Files, parts.Deletions);
+        var digest = ComputeDigest(source, destination, serial, options, parts.Directories, parts.Files, parts.Deletions, parts.Timestamps);
         return new SyncPlan(source, destination, serial, NormalizeOptions(options), parts.Directories, parts.Files,
-            parts.Deletions, parts.TransferBytes, removals, digest, sourceFiles, preconditions);
+            parts.Deletions, parts.Timestamps, parts.TransferBytes, removals, digest, sourceFiles, preconditions);
     }
 
     public static string ComputeDigest(
         string source, string destination, string serial, PushOptions options,
         IReadOnlyList<PlannedChange> directories, IReadOnlyList<PlannedChange> files,
-        IReadOnlyList<PlannedChange> deletions)
+        IReadOnlyList<PlannedChange> deletions, IReadOnlyList<PlannedChange> timestamps)
     {
-        var writer = new ProtocolWriter(); writer.WriteString("SYNCER-PLAN"); writer.WriteUInt32(1);
+        var writer = new ProtocolWriter(); writer.WriteString("SYNCER-PLAN"); writer.WriteUInt32(2);
         writer.WriteString(source); writer.WriteString(destination); writer.WriteString(serial);
         writer.WriteByte(options.DeleteExtraneous ? (byte)0 : (byte)1); writer.WriteByte(options.Direct ? (byte)1 : (byte)0);
         writer.WriteInt64(ToToleranceSeconds(options)); writer.WriteUInt32(checked((uint)options.Exclusions.Count));
         foreach (var exclusion in options.Exclusions) writer.WriteString(exclusion);
-        WriteChanges(writer, directories); WriteChanges(writer, files); WriteChanges(writer, deletions);
+        WriteChanges(writer, directories); WriteChanges(writer, files); WriteChanges(writer, deletions); WriteChanges(writer, timestamps);
         return Blake3.Hex(Blake3.Hash(writer.ToArray()));
     }
 
@@ -47,6 +47,7 @@ internal static class SavedPlans
             ["directories"] = ChangesJson(plan.Directories, null),
             ["files"] = ChangesJson(plan.Files, plan.SourceFiles),
             ["deletions"] = ChangesJson(plan.Deletions, null),
+            ["timestamps"] = ChangesJson(plan.Timestamps, null),
             ["preconditions"] = PreconditionsJson(plan.Preconditions),
         };
         var fullPath = Path.GetFullPath(path); var directory = Path.GetDirectoryName(fullPath);
@@ -86,13 +87,14 @@ internal static class SavedPlans
             var directories = ParseChanges(RequiredArray(root, "directories"), false, sources);
             var files = ParseChanges(RequiredArray(root, "files"), true, sources);
             var deletions = ParseChanges(RequiredArray(root, "deletions"), false, sources);
-            ValidateActions(directories, files, deletions);
+            var timestamps = ParseChanges(RequiredArray(root, "timestamps"), false, sources);
+            ValidateActions(directories, files, deletions, timestamps);
             var preconditions = ParsePreconditions(RequiredArray(root, "preconditions"));
-            var digest = ComputeDigest(source, destination, serial, options, directories, files, deletions);
+            var digest = ComputeDigest(source, destination, serial, options, directories, files, deletions, timestamps);
             if (!string.Equals(digest, claimedDigest, StringComparison.Ordinal))
                 throw new SyncerException(SyncerErrorCode.Safety, "saved plan digest does not match its contents");
             var bytes = files.Aggregate<PlannedChange, ulong>(0, (value, change) => value + change.Entry.Size);
-            return new SyncPlan(source, destination, serial, options, directories, files, deletions, bytes,
+            return new SyncPlan(source, destination, serial, options, directories, files, deletions, timestamps, bytes,
                 Required<ulong>(root, "removal_count"), claimedDigest, sources, preconditions);
         }
         catch (OperationCanceledException) { throw; }
@@ -172,8 +174,10 @@ internal static class SavedPlans
         }
         return result;
     }
-    private static void ValidateActions(IEnumerable<PlannedChange> directories, IEnumerable<PlannedChange> files, IEnumerable<PlannedChange> deletions)
+    private static void ValidateActions(IEnumerable<PlannedChange> directories, IEnumerable<PlannedChange> files, IEnumerable<PlannedChange> deletions, IEnumerable<PlannedChange> timestamps)
     {
+        if (timestamps.Any(c => c.Entry.Type != EntryType.File || c.Action != PlanAction.RecordTimestamp))
+            throw new SyncerException(SyncerErrorCode.Safety, "saved plan contains an invalid timestamp record");
         if (directories.Any(c => c.Entry.Type != EntryType.Directory || c.Action is not (PlanAction.CreateDirectory or PlanAction.ReplaceWithDirectory)) ||
             files.Any(c => c.Entry.Type != EntryType.File || c.Action is not (PlanAction.AddFile or PlanAction.UpdateFile or PlanAction.ReplaceWithFile)) ||
             deletions.Any(c => c.Action != (c.Entry.Type switch { EntryType.File => PlanAction.DeleteFile, EntryType.Directory => PlanAction.DeleteDirectory, _ => PlanAction.DeleteOther })))
@@ -183,13 +187,15 @@ internal static class SavedPlans
     {
         PlanAction.CreateDirectory => "create_directory", PlanAction.ReplaceWithDirectory => "replace_with_directory",
         PlanAction.AddFile => "add_file", PlanAction.UpdateFile => "update_file", PlanAction.ReplaceWithFile => "replace_with_file",
-        PlanAction.DeleteFile => "delete_file", PlanAction.DeleteDirectory => "delete_directory", PlanAction.DeleteOther => "delete_other", _ => throw new ArgumentOutOfRangeException(nameof(action)),
+        PlanAction.DeleteFile => "delete_file", PlanAction.DeleteDirectory => "delete_directory", PlanAction.DeleteOther => "delete_other",
+        PlanAction.RecordTimestamp => "record_timestamp", _ => throw new ArgumentOutOfRangeException(nameof(action)),
     };
     private static PlanAction ParseAction(string action) => action switch
     {
         "create_directory" => PlanAction.CreateDirectory, "replace_with_directory" => PlanAction.ReplaceWithDirectory,
         "add_file" => PlanAction.AddFile, "update_file" => PlanAction.UpdateFile, "replace_with_file" => PlanAction.ReplaceWithFile,
         "delete_file" => PlanAction.DeleteFile, "delete_directory" => PlanAction.DeleteDirectory, "delete_other" => PlanAction.DeleteOther,
+        "record_timestamp" => PlanAction.RecordTimestamp,
         _ => throw new SyncerException(SyncerErrorCode.Safety, "saved plan contains an unknown action"),
     };
     private static T Required<T>(JsonObject node, string name)

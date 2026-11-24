@@ -6,8 +6,8 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Syncer.Client/Syncer.Client.csproj" />
     <PackageReference Include="MSTest" />
-    <None Include="../../../tests/protocol-v6-vectors.txt" Link="protocol-v6-vectors.txt" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="../../../tests/native-plan-v1.json" Link="native-plan-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../tests/protocol-v7-vectors.txt" Link="protocol-v7-vectors.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../tests/native-plan-v2.json" Link="native-plan-v2.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../../CMakeLists.txt" Link="CMakeLists.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

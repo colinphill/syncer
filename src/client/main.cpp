@@ -318,8 +318,13 @@ void with_server(Adb& adb, CancellationState& cancellation, Action action) {
 }
 
 boost::json::object counts(std::size_t files, std::size_t directories, std::size_t deletions,
-                           std::uint64_t bytes = 0) {
-    return {{"files", files}, {"directories", directories}, {"deletions", deletions}, {"bytes", bytes}};
+                           std::uint64_t bytes = 0, std::size_t timestamps = 0) {
+    return {{"files", files}, {"directories", directories}, {"deletions", deletions}, {"bytes", bytes},
+            {"timestamps", timestamps}};
+}
+
+bool has_content_changes(const SyncPlan& plan) {
+    return !plan.files.empty() || !plan.directories.empty() || !plan.deletions.empty();
 }
 
 std::string_view action_name(PlanAction action) {
@@ -332,6 +337,7 @@ std::string_view action_name(PlanAction action) {
     case PlanAction::delete_file: return "DELETE FILE";
     case PlanAction::delete_directory: return "DELETE DIRECTORY";
     case PlanAction::delete_other: return "DELETE ENTRY";
+    case PlanAction::record_timestamp: return "RECORD TIMESTAMP";
     }
     return "CHANGE";
 }
@@ -346,6 +352,7 @@ std::string_view action_id(PlanAction action) {
     case PlanAction::delete_file: return "delete_file";
     case PlanAction::delete_directory: return "delete_directory";
     case PlanAction::delete_other: return "delete_other";
+    case PlanAction::record_timestamp: return "record_timestamp";
     }
     return "unknown";
 }
@@ -359,6 +366,7 @@ PlanAction parse_action_id(std::string_view value) {
     if (value == "delete_file") return PlanAction::delete_file;
     if (value == "delete_directory") return PlanAction::delete_directory;
     if (value == "delete_other") return PlanAction::delete_other;
+    if (value == "record_timestamp") return PlanAction::record_timestamp;
     throw Error(ExitCode::safety, "saved plan contains an unknown action");
 }
 
@@ -371,7 +379,7 @@ void append_change(ByteWriter& writer, const PlannedChange& change) {
 std::string plan_digest(const SyncPlan& plan, std::string_view source, std::string_view destination,
                         std::string_view serial, const Options& options) {
     ByteWriter writer;
-    writer.string("SYNCER-PLAN"); writer.u32(1);
+    writer.string("SYNCER-PLAN"); writer.u32(2);
     writer.string(source); writer.string(destination); writer.string(serial);
     writer.u8(options.no_delete ? 1 : 0);
     writer.u8(options.direct ? 1 : 0);
@@ -384,6 +392,8 @@ std::string plan_digest(const SyncPlan& plan, std::string_view source, std::stri
     for (const auto& change : plan.files) append_change(writer, change);
     writer.u32(static_cast<std::uint32_t>(plan.deletions.size()));
     for (const auto& change : plan.deletions) append_change(writer, change);
+    writer.u32(static_cast<std::uint32_t>(plan.timestamps.size()));
+    for (const auto& change : plan.timestamps) append_change(writer, change);
     const auto bytes = std::move(writer).take();
     Blake3 hash;
     hash.update(std::span<const std::uint8_t>(bytes));
@@ -469,6 +479,7 @@ std::vector<DestinationPrecondition> build_preconditions(const SyncPlan& plan,
     for (const auto& change : plan.directories) add_change(change);
     for (const auto& change : plan.files) add_change(change);
     for (const auto& change : plan.deletions) add_change(change);
+    for (const auto& change : plan.timestamps) add_change(change);
     std::vector<DestinationPrecondition> result;
     result.reserve(values.size());
     for (auto& [path, value] : values) result.push_back(std::move(value));
@@ -487,13 +498,14 @@ void save_plan_file(const fs::path& path, const SyncPlan& plan, const SourceTree
         preconditions.emplace_back(std::move(object));
     }
     boost::json::object root{
-        {"schema", 1}, {"syncer_version", kVersion}, {"protocol", kProtocolVersion},
+        {"schema", 2}, {"syncer_version", kVersion}, {"protocol", kProtocolVersion},
         {"source", options.positional[0]}, {"destination", options.positional[1]},
         {"device", serial}, {"direct", options.direct}, {"no_delete", options.no_delete},
         {"mtime_tolerance_seconds", options.mtime_tolerance_seconds},
         {"excludes", std::move(excludes)}, {"plan_digest", digest}, {"removal_count", removals},
         {"directories", changes_json(plan.directories)}, {"files", changes_json(plan.files, &source)},
-        {"deletions", changes_json(plan.deletions)}, {"preconditions", std::move(preconditions)}};
+        {"deletions", changes_json(plan.deletions)}, {"timestamps", changes_json(plan.timestamps)},
+        {"preconditions", std::move(preconditions)}};
     const auto serialized = boost::json::serialize(root);
     std::error_code error;
     if (!path.parent_path().empty()) fs::create_directories(path.parent_path(), error);
@@ -544,7 +556,7 @@ SavedPlan load_plan_file(const fs::path& path) {
     try {
         const auto document = boost::json::parse(text);
         const auto& root = document.as_object();
-        if (root.at("schema").to_number<std::uint64_t>() != 1 ||
+        if (root.at("schema").to_number<std::uint64_t>() != 2 ||
             root.at("protocol").to_number<std::uint64_t>() != kProtocolVersion)
             throw Error(ExitCode::safety, "saved plan has an unsupported schema or protocol");
         SavedPlan saved;
@@ -563,6 +575,7 @@ SavedPlan load_plan_file(const fs::path& path) {
         saved.plan.directories = parse_changes(root.at("directories").as_array(), saved, false);
         saved.plan.files = parse_changes(root.at("files").as_array(), saved, true);
         saved.plan.deletions = parse_changes(root.at("deletions").as_array(), saved, false);
+        saved.plan.timestamps = parse_changes(root.at("timestamps").as_array(), saved, false);
         for (const auto& change : saved.plan.directories)
             if (change.entry.type != EntryType::directory ||
                 (change.action != PlanAction::create_directory &&
@@ -578,6 +591,9 @@ SavedPlan load_plan_file(const fs::path& path) {
                 (change.entry.type == EntryType::directory && change.action != PlanAction::delete_directory) ||
                 (change.entry.type == EntryType::other && change.action != PlanAction::delete_other))
                 throw Error(ExitCode::safety, "saved plan contains an invalid deletion action");
+        for (const auto& change : saved.plan.timestamps)
+            if (change.entry.type != EntryType::file || change.action != PlanAction::record_timestamp)
+                throw Error(ExitCode::safety, "saved plan contains an invalid timestamp record");
         for (const auto& change : saved.plan.files) saved.plan.transfer_bytes += change.entry.size;
         for (const auto& value : root.at("preconditions").as_array()) {
             const auto& object = value.as_object();
@@ -638,9 +654,16 @@ std::uint64_t removal_count(const SyncPlan& plan, const Manifest& destination) {
     return removals.size();
 }
 
+void print_timestamp_records(const SyncPlan& plan) {
+    if (plan.timestamps.empty()) return;
+    std::cerr << "Timestamp records: " << plan.timestamps.size()
+              << " unchanged file(s) will have their destination time recorded without transferring data\n";
+}
+
 void print_changes(const SyncPlan& plan) {
-    if (plan.directories.empty() && plan.files.empty() && plan.deletions.empty()) {
+    if (!has_content_changes(plan)) {
         std::cerr << "Selected changes: none\n";
+        print_timestamp_records(plan);
         return;
     }
     std::cerr << "Selected changes:\n";
@@ -651,6 +674,14 @@ void print_changes(const SyncPlan& plan) {
     for (const auto& change : plan.directories) print(change);
     for (const auto& change : plan.files) print(change);
     for (const auto& change : plan.deletions) print(change);
+    print_timestamp_records(plan);
+}
+
+std::size_t record_timestamps(ClientSession& session, const SyncPlan& plan) {
+    if (plan.timestamps.empty()) return 0;
+    std::cerr << "Recording " << plan.timestamps.size() << " destination timestamp(s)\n";
+    session.record_times(plan.timestamps);
+    return plan.timestamps.size();
 }
 
 void apply_deletions(ClientSession& session, const SyncPlan& plan,
@@ -686,12 +717,16 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
 
     std::string recovery_id;
     std::size_t applied_directories{}, applied_files{}, applied_deletions{}, applied_quarantines{};
+    std::size_t applied_timestamps{};
     std::uint64_t transferred_bytes{};
     print_changes(saved.plan);
     with_server(adb, cancellation, [&](ClientSession& session) {
         session.select_root(saved.destination);
         session.validate_plan(saved.preconditions);
-        if (saved.plan.files.empty() && saved.plan.directories.empty() && saved.plan.deletions.empty()) return;
+        if (!has_content_changes(saved.plan)) {
+            applied_timestamps = record_timestamps(session, saved.plan);
+            return;
+        }
         if (!saved.options.direct) {
             recovery_id = random_token().substr(0, 24);
             session.prepare(recovery_id);
@@ -727,13 +762,13 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
         }
         apply_deletions(session, saved.plan, !saved.options.direct,
                         applied_deletions, applied_quarantines);
+        applied_timestamps = record_timestamps(session, saved.plan);
     });
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
     if (options.json) {
-        const auto status = saved.plan.files.empty() && saved.plan.directories.empty() &&
-            saved.plan.deletions.empty() ? "no_changes" : "success";
+        const auto status = has_content_changes(saved.plan) ? "success" : "no_changes";
         boost::json::object result{
             {"schema", 1}, {"status", status}, {"device", adb.serial()},
             {"source", saved.source}, {"destination", saved.destination},
@@ -744,8 +779,10 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
             {"actions", plan_actions(saved.plan)},
             {"recovery_id", recovery_id.empty() ? boost::json::value(nullptr) : boost::json::value(recovery_id)},
             {"planned", counts(saved.plan.files.size(), saved.plan.directories.size(),
-                               saved.plan.deletions.size(), saved.plan.transfer_bytes)},
-            {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes)},
+                               saved.plan.deletions.size(), saved.plan.transfer_bytes,
+                               saved.plan.timestamps.size())},
+            {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes,
+                               applied_timestamps)},
             {"quarantined_count", applied_quarantines}, {"transferred_bytes", transferred_bytes},
             {"duration_ms", elapsed}, {"error", nullptr}};
         std::cout << boost::json::serialize(result) << '\n';
@@ -753,7 +790,9 @@ int execute_saved_plan(const Options& options, CancellationState& cancellation) 
         std::cout << "Applied saved plan: " << saved.plan.files.size() << " file(s), "
                   << saved.plan.directories.size() << " directorie(s), "
                   << saved.plan.deletions.size() << " deletion(s), "
-                  << saved.plan.transfer_bytes << " byte(s)\n";
+                  << saved.plan.transfer_bytes << " byte(s)";
+        if (applied_timestamps != 0) std::cout << ", " << applied_timestamps << " timestamp record(s)";
+        std::cout << '\n';
     }
     return 0;
 }
@@ -846,13 +885,16 @@ int execute(const Options& options, CancellationState& cancellation) {
     std::string recovery_id;
     std::uint64_t planned_removals{};
     std::size_t applied_directories{}, applied_files{}, applied_deletions{}, applied_quarantines{};
+    std::size_t applied_timestamps{};
     std::uint64_t transferred_bytes{};
     with_server(adb, cancellation, [&](ClientSession& session) {
         std::cerr << "Scanning destination...\n";
-        const auto destination = session.scan(options.positional[1]);
+        const auto scanned = session.scan(options.positional[1]);
+        const auto& destination = scanned.entries;
         const auto source = source_scan.get();
         plan = make_plan(source.manifest, destination, exclusions, !options.no_delete,
-                         static_cast<std::uint64_t>(options.mtime_tolerance_seconds));
+                         static_cast<std::uint64_t>(options.mtime_tolerance_seconds),
+                         scanned.untracked_times);
         digest = plan_digest(plan, options.positional[0], options.positional[1], adb.serial(), options);
         planned_removals = removal_count(plan, destination);
         print_changes(plan);
@@ -865,7 +907,10 @@ int execute(const Options& options, CancellationState& cancellation) {
             save_plan_file(*options.save_plan, plan, source, destination, options,
                            adb.serial(), digest, planned_removals);
         if (options.dry_run) return;
-        if (plan.files.empty() && plan.directories.empty() && plan.deletions.empty()) return;
+        if (!has_content_changes(plan)) {
+            applied_timestamps = record_timestamps(session, plan);
+            return;
+        }
         if (!options.direct) {
             recovery_id = random_token().substr(0, 24);
             session.prepare(recovery_id);
@@ -917,11 +962,12 @@ int execute(const Options& options, CancellationState& cancellation) {
         if (options.direct) verify_source_tree();
         apply_deletions(session, plan, !options.direct,
                         applied_deletions, applied_quarantines);
+        applied_timestamps = record_timestamps(session, plan);
     });
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     if (options.json) {
         const auto status = options.dry_run ? "dry_run" :
-            (plan.files.empty() && plan.directories.empty() && plan.deletions.empty() ? "no_changes" : "success");
+            (has_content_changes(plan) ? "success" : "no_changes");
         boost::json::object result{
             {"schema", 1}, {"status", status}, {"device", adb.serial()},
             {"source", options.positional[0]}, {"destination", options.positional[1]},
@@ -934,8 +980,10 @@ int execute(const Options& options, CancellationState& cancellation) {
             {"plan_file", options.save_plan ? boost::json::value(path_to_utf8(*options.save_plan)) : boost::json::value(nullptr)},
             {"actions", plan_actions(plan)},
             {"recovery_id", recovery_id.empty() ? boost::json::value(nullptr) : boost::json::value(recovery_id)},
-            {"planned", counts(plan.files.size(), plan.directories.size(), plan.deletions.size(), plan.transfer_bytes)},
-            {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes)},
+            {"planned", counts(plan.files.size(), plan.directories.size(), plan.deletions.size(), plan.transfer_bytes,
+                               plan.timestamps.size())},
+            {"applied", counts(applied_files, applied_directories, applied_deletions, transferred_bytes,
+                               applied_timestamps)},
             {"quarantined_count", applied_quarantines},
             {"transferred_bytes", transferred_bytes},
             {"duration_ms", elapsed}, {"error", nullptr}};
@@ -943,7 +991,10 @@ int execute(const Options& options, CancellationState& cancellation) {
     } else {
         std::cout << (options.dry_run ? "Dry run: " : "Synchronized: ") << plan.files.size() << " file(s), "
                   << plan.directories.size() << " directorie(s), " << plan.deletions.size() << " deletion(s), "
-                  << plan.transfer_bytes << " byte(s)\n";
+                  << plan.transfer_bytes << " byte(s)";
+        const auto timestamps = options.dry_run ? plan.timestamps.size() : applied_timestamps;
+        if (timestamps != 0) std::cout << ", " << timestamps << " timestamp record(s)";
+        std::cout << '\n';
     }
     return 0;
 }

@@ -297,6 +297,7 @@ void Server::dispatch(LocalSocket& client, const Frame& frame) {
     case MessageType::commit_file: commit_file(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::delete_path: delete_path(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::set_mtime: set_mtime(reader); reader.require_end(); send_ok(client, frame.request_id); break;
+    case MessageType::record_times: record_times(reader); reader.require_end(); send_ok(client, frame.request_id); break;
     case MessageType::shutdown:
         reader.require_end();
         save_metadata();
@@ -748,19 +749,19 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     constexpr std::size_t batch_limit = 512U * 1024U;
     constexpr std::size_t worker_batch_entries = 1024;
     constexpr std::size_t queued_batch_limit = 8;
-    std::vector<ManifestEntry> batch;
+    std::vector<ScanEntry> batch;
     std::size_t batch_bytes{};
     const auto flush = [&] {
         if (batch.empty()) return;
         ByteWriter writer;
         writer.u32(static_cast<std::uint32_t>(batch.size()));
-        for (const auto& entry : batch) encode_manifest_entry(writer, entry);
+        for (const auto& entry : batch) encode_scan_entry(writer, entry);
         send_frame(client, Frame{MessageType::manifest_batch, request_id, std::move(writer).take()});
         batch.clear();
         batch_bytes = 0;
     };
-    const auto emit = [&](ManifestEntry entry) {
-        const auto encoded_size = 4U + entry.path.size() + 1U + 8U + 8U;
+    const auto emit = [&](ScanEntry entry) {
+        const auto encoded_size = 4U + entry.entry.path.size() + 1U + 8U + 8U + 1U;
         if (!batch.empty() && batch_bytes + encoded_size > batch_limit) flush();
         batch_bytes += encoded_size;
         batch.push_back(std::move(entry));
@@ -774,7 +775,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     std::mutex mutex;
     std::condition_variable ready;
     std::deque<DirectoryTask> directories;
-    std::deque<std::vector<ManifestEntry>> completed_batches;
+    std::deque<std::vector<ScanEntry>> completed_batches;
     directories.push_back({root_, {}, 0});
     std::size_t outstanding_directories = 1;
     bool finished{};
@@ -788,7 +789,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
         directories.clear();
         ready.notify_all();
     };
-    const auto publish = [&](std::vector<ManifestEntry>& entries) {
+    const auto publish = [&](std::vector<ScanEntry>& entries) {
         if (entries.empty()) return true;
         std::unique_lock lock(mutex);
         ready.wait(lock, [&] { return stopping || completed_batches.size() < queued_batch_limit; });
@@ -814,7 +815,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
                     throw Error(ExitCode::transfer, "destination directory nesting exceeds limit");
                 std::unique_ptr<DIR, int(*)(DIR*)> directory(::opendir(task.physical.c_str()), ::closedir);
                 if (!directory) throw Error(ExitCode::transfer, "cannot open destination directory");
-                std::vector<ManifestEntry> entries;
+                std::vector<ScanEntry> entries;
                 entries.reserve(worker_batch_entries);
                 while (true) {
                     errno = 0;
@@ -843,11 +844,14 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
                     entry.size = is_file ? static_cast<std::uint64_t>(value.st_size) : 0;
                     entry.modified_seconds = is_file ? static_cast<std::int64_t>(value.st_mtim.tv_sec) : 0;
                     entry.type = is_file ? EntryType::file : is_directory ? EntryType::directory : EntryType::other;
+                    std::uint8_t flags{};
                     if (is_file) {
                         const auto logical = logical_times_.find(relative);
                         if (logical != logical_times_.end() && logical->second.type == EntryType::file &&
                             logical->second.size == entry.size)
                             entry.modified_seconds = logical->second.modified_seconds;
+                        else
+                            flags = kScanEntryUntrackedTime;
                     }
                     if (entry.type == EntryType::directory) {
                         std::lock_guard lock(mutex);
@@ -855,7 +859,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
                         ++outstanding_directories;
                         ready.notify_all();
                     }
-                    entries.push_back(std::move(entry));
+                    entries.push_back(ScanEntry{std::move(entry), flags});
                     if (entries.size() == worker_batch_entries && !publish(entries)) return;
                 }
                 if (!publish(entries)) return;
@@ -881,7 +885,7 @@ void Server::send_manifest(LocalSocket& client, std::uint32_t request_id) {
     try {
         for (unsigned index = 0; index < worker_count; ++index) workers.emplace_back(worker);
         while (true) {
-            std::vector<ManifestEntry> entries;
+            std::vector<ScanEntry> entries;
             {
                 std::unique_lock lock(mutex);
                 ready.wait(lock, [&] { return failure || !completed_batches.empty() || finished; });
@@ -1088,6 +1092,32 @@ void Server::set_mtime(ByteReader& reader) {
     const auto size = type == EntryType::file ? fs::file_size(destination) : 0;
     logical_times_[relative] = LogicalTime{type, size, seconds};
     metadata_dirty_ = true;
+}
+
+void Server::record_times(ByteReader& reader) {
+    require_root();
+    const auto count = reader.u32();
+    if (count > kMaxFramePayload / (4U + 1U + 1U + 8U + 8U))
+        throw Error(ExitCode::transfer, "timestamp record count exceeds limit");
+    std::vector<std::pair<ManifestEntry, fs::path>> records;
+    records.reserve(count);
+    // Check every record before the first mutation so a destination that changed after the
+    // scan cannot leave a partially recorded batch.
+    for (std::uint32_t index = 0; index < count; ++index) {
+        auto entry = decode_manifest_entry(reader);
+        if (entry.type != EntryType::file) throw Error(ExitCode::transfer, "timestamp record must describe a file");
+        auto destination = destination_path(entry.path, false);
+        struct stat value{};
+        if (::lstat(destination.c_str(), &value) != 0 || !S_ISREG(value.st_mode) ||
+            static_cast<std::uint64_t>(value.st_size) != entry.size)
+            throw Error(ExitCode::source_changed, "destination changed after it was scanned: " + entry.path);
+        records.emplace_back(std::move(entry), std::move(destination));
+    }
+    for (const auto& [entry, destination] : records) {
+        apply_mtime(destination, entry.modified_seconds);
+        logical_times_[entry.path] = LogicalTime{EntryType::file, entry.size, entry.modified_seconds};
+    }
+    if (!records.empty()) metadata_dirty_ = true;
 }
 
 } // namespace syncer::server

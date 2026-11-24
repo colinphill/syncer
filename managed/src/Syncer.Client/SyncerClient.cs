@@ -84,9 +84,11 @@ public sealed class SyncerClient
 
     private static SyncPlan BuildPlan(
         string sourcePath, string devicePath, string serial, PushOptions options, GlobSet exclusions,
-        SourceTree source, IReadOnlyDictionary<string, ManifestEntry> destination, IProgress<SyncerProgress>? progress)
+        SourceTree source, DestinationManifest scanned, IProgress<SyncerProgress>? progress)
     {
-        var parts = Planner.MakePlan(source.Manifest, destination, exclusions, options.DeleteExtraneous, checked((ulong)SavedPlans.ToToleranceSeconds(options)));
+        var destination = scanned.Entries;
+        var parts = Planner.MakePlan(source.Manifest, destination, exclusions, options.DeleteExtraneous,
+            checked((ulong)SavedPlans.ToToleranceSeconds(options)), scanned.UntrackedTimes);
         var removals = Planner.RemovalCount(parts, destination);
         if (options.MaximumRemovals is { } maximum && removals > maximum)
             throw new SyncerException(SyncerErrorCode.Safety, $"plan removes {removals} entries, exceeding MaximumRemovals {maximum}");
@@ -106,7 +108,7 @@ public sealed class SyncerClient
         ClientSession session, SyncPlan plan, SourceTree? freshSource, bool verifyWholeTree,
         IProgress<SyncerProgress>? progress, CancellationToken cancellationToken)
     {
-        if (!plan.HasChanges) return new(null, 0, 0, 0, 0, 0);
+        if (!plan.HasChanges) return new(null, 0, 0, 0, 0, 0, await RecordTimestampsAsync(session, plan, progress, cancellationToken).ConfigureAwait(false));
         string? recoveryId = null;
         if (!plan.Options.Direct)
         {
@@ -171,7 +173,17 @@ public sealed class SyncerClient
             }
             foreach (var affected in group) progress?.Report(new(SyncerProgressStage.CompletedChange, affected.Path, affected));
         }
-        return new(recoveryId, files, directories, plan.Deletions.Count, quarantined, bytes);
+        var timestamps = await RecordTimestampsAsync(session, plan, progress, cancellationToken).ConfigureAwait(false);
+        return new(recoveryId, files, directories, plan.Deletions.Count, quarantined, bytes, timestamps);
+    }
+
+    private static async Task<int> RecordTimestampsAsync(
+        ClientSession session, SyncPlan plan, IProgress<SyncerProgress>? progress, CancellationToken cancellationToken)
+    {
+        if (plan.Timestamps.Count == 0) return 0;
+        progress?.Report(new(SyncerProgressStage.RecordingTimestamps, ItemCount: plan.Timestamps.Count));
+        await session.RecordTimesAsync(plan.Timestamps, cancellationToken).ConfigureAwait(false);
+        return plan.Timestamps.Count;
     }
 
     internal static async Task RunChangeAsync(
@@ -206,8 +218,8 @@ public sealed class SyncerClient
         plan.HasChanges ? SyncStatus.Success : SyncStatus.NoChanges, plan.DeviceSerial, plan.Source, plan.Destination,
         plan.Options.Direct, SavedPlans.ToToleranceSeconds(plan.Options), plan.Options.MaximumRemovals, plan.RemovalCount,
         plan.Digest, planFile, applied.RecoveryId,
-        new(plan.Files.Count, plan.Directories.Count, plan.Deletions.Count, plan.TransferBytes),
-        new(applied.Files, applied.Directories, applied.Deletions, applied.Bytes), applied.Quarantined,
+        new(plan.Files.Count, plan.Directories.Count, plan.Deletions.Count, plan.TransferBytes, plan.Timestamps.Count),
+        new(applied.Files, applied.Directories, applied.Deletions, applied.Bytes, applied.Timestamps), applied.Quarantined,
         applied.Bytes, duration, plan.Directories.Concat(plan.Files).Concat(plan.Deletions).ToArray());
     private static void ValidatePush(string source, string destination, PushOptions options)
     { ArgumentException.ThrowIfNullOrWhiteSpace(source); ArgumentException.ThrowIfNullOrWhiteSpace(destination); _ = SavedPlans.ToToleranceSeconds(options); }
@@ -256,5 +268,5 @@ public sealed class SyncerClient
     }
     private Task WithServerAsync(AdbClient adb, Func<ClientSession, CancellationToken, Task> action, CancellationToken cancellationToken) =>
         WithServerAsync(adb, async (session, token) => { await action(session, token).ConfigureAwait(false); return true; }, cancellationToken);
-    private sealed record AppliedState(string? RecoveryId, int Files, int Directories, int Deletions, int Quarantined, ulong Bytes);
+    private sealed record AppliedState(string? RecoveryId, int Files, int Directories, int Deletions, int Quarantined, ulong Bytes, int Timestamps);
 }

@@ -1,6 +1,6 @@
 # Syncer.Client
 
-`Syncer.Client` is the managed, asynchronous client for syncer protocol 6. It initializes and
+`Syncer.Client` is the managed, asynchronous client for syncer protocol 7. It initializes and
 mirrors host directories into managed Android shared-storage destinations over ADB.
 
 ```csharp

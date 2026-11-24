@@ -43,6 +43,26 @@ std::string metadata_reason(const ManifestEntry& source, const ManifestEntry& de
     return reason;
 }
 
+bool matches_daylight_saving_shift(std::uint64_t difference, std::uint64_t tolerance_seconds) {
+    const auto distance = difference >= kDaylightSavingShiftSeconds
+        ? difference - kDaylightSavingShiftSeconds
+        : kDaylightSavingShiftSeconds - difference;
+    return distance <= tolerance_seconds;
+}
+
+std::string daylight_saving_shift_reason(const ManifestEntry& source, const ManifestEntry& destination,
+                                         std::uint64_t mtime_tolerance_seconds) {
+    return "destination modification time differs by " +
+           std::to_string(mtime_difference(source.modified_seconds, destination.modified_seconds)) +
+           " seconds (source " + std::to_string(source.modified_seconds) + ", destination " +
+           std::to_string(destination.modified_seconds) +
+           "), matching a one-hour daylight-saving shift within the tolerance of " +
+           std::to_string(mtime_tolerance_seconds) + " seconds";
+}
+
+constexpr const char* kUntrackedTimeReason =
+    "destination modification time is not recorded in the timestamp catalog";
+
 PlanAction deletion_action(EntryType type) {
     switch (type) {
     case EntryType::file: return PlanAction::delete_file;
@@ -74,7 +94,8 @@ std::size_t path_depth(std::string_view path) {
 
 SyncPlan make_plan(const Manifest& source, const Manifest& destination,
                    const GlobSet& exclusions, bool delete_extras,
-                   std::uint64_t mtime_tolerance_seconds) {
+                   std::uint64_t mtime_tolerance_seconds,
+                   const PathSet& untracked_destination_times) {
     SyncPlan plan;
     for (const auto& [path, source_entry] : source) {
         const auto found = destination.find(path);
@@ -96,12 +117,25 @@ SyncPlan make_plan(const Manifest& source, const Manifest& destination,
                 plan.files.push_back({source_entry, PlanAction::replace_with_file,
                                       "destination path is a " + type_name(found->second.type)});
                 plan.transfer_bytes += source_entry.size;
-            } else if (found->second.size != source_entry.size ||
-                       mtime_differs(source_entry, found->second, mtime_tolerance_seconds)) {
-                plan.files.push_back({source_entry, PlanAction::update_file,
-                                      metadata_reason(source_entry, found->second,
-                                                      mtime_tolerance_seconds)});
-                plan.transfer_bytes += source_entry.size;
+            } else {
+                const auto& destination_entry = found->second;
+                const bool untracked = untracked_destination_times.contains(path);
+                const auto difference =
+                    mtime_difference(source_entry.modified_seconds, destination_entry.modified_seconds);
+                if (destination_entry.size != source_entry.size ||
+                    (difference > mtime_tolerance_seconds &&
+                     !(untracked && matches_daylight_saving_shift(difference, mtime_tolerance_seconds)))) {
+                    plan.files.push_back({source_entry, PlanAction::update_file,
+                                          metadata_reason(source_entry, destination_entry,
+                                                          mtime_tolerance_seconds)});
+                    plan.transfer_bytes += source_entry.size;
+                } else if (untracked) {
+                    plan.timestamps.push_back({source_entry, PlanAction::record_timestamp,
+                        difference > mtime_tolerance_seconds
+                            ? daylight_saving_shift_reason(source_entry, destination_entry,
+                                                           mtime_tolerance_seconds)
+                            : std::string(kUntrackedTimeReason)});
+                }
             }
         }
     }
@@ -118,6 +152,9 @@ SyncPlan make_plan(const Manifest& source, const Manifest& destination,
                (path_depth(a.entry.path) == path_depth(b.entry.path) && a.entry.path < b.entry.path);
     });
     std::sort(plan.files.begin(), plan.files.end(), [](const auto& a, const auto& b) {
+        return a.entry.path < b.entry.path;
+    });
+    std::sort(plan.timestamps.begin(), plan.timestamps.end(), [](const auto& a, const auto& b) {
         return a.entry.path < b.entry.path;
     });
     std::sort(plan.deletions.begin(), plan.deletions.end(), [](const auto& a, const auto& b) {

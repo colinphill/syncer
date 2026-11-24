@@ -78,6 +78,17 @@ ManifestEntry decode_manifest_entry(ByteReader& reader) {
     return entry;
 }
 
+void encode_scan_entry(ByteWriter& writer, const ScanEntry& entry) {
+    encode_manifest_entry(writer, entry.entry); writer.u8(entry.flags);
+}
+ScanEntry decode_scan_entry(ByteReader& reader) {
+    ScanEntry entry{decode_manifest_entry(reader), reader.u8()};
+    if ((entry.flags & ~kScanEntryUntrackedTime) != 0 ||
+        ((entry.flags & kScanEntryUntrackedTime) != 0 && entry.entry.type != EntryType::file))
+        throw Error(ExitCode::transfer, "invalid manifest entry flags");
+    return entry;
+}
+
 UploadPlacement decode_upload_placement(ByteReader& reader) {
     const auto value = reader.u8();
     if (value > static_cast<std::uint8_t>(UploadPlacement::direct))

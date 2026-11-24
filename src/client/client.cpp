@@ -98,11 +98,12 @@ void ClientSession::initialize(std::string_view device_path, bool adopt) {
     operation(MessageType::initialize, std::move(writer).take());
 }
 
-Manifest ClientSession::scan(std::string_view device_path) {
+DestinationManifest ClientSession::scan(std::string_view device_path) {
     ByteWriter writer; writer.string(device_path);
     const auto request = next_request();
     send_frame(socket_, Frame{MessageType::scan, request, std::move(writer).take()});
-    Manifest manifest;
+    DestinationManifest result;
+    auto& manifest = result.entries;
     manifest.reserve(4096);
     while (true) {
         const auto response = receive_frame(socket_);
@@ -113,23 +114,25 @@ Manifest ClientSession::scan(std::string_view device_path) {
         if (response.request_id != request) throw Error(ExitCode::transfer, "destination manifest response has wrong request ID");
         if (response.type == MessageType::manifest_end) break;
         ByteReader entry_reader(response.payload);
-        const auto add_entry = [&](ManifestEntry entry) {
-            if (!manifest.emplace(entry.path, entry).second)
+        const auto add_entry = [&](ScanEntry scanned) {
+            if ((scanned.flags & kScanEntryUntrackedTime) != 0)
+                result.untracked_times.insert(scanned.entry.path);
+            if (!manifest.emplace(scanned.entry.path, std::move(scanned.entry)).second)
                 throw Error(ExitCode::transfer, "duplicate destination manifest path");
         };
         if (response.type == MessageType::manifest_entry) {
-            add_entry(decode_manifest_entry(entry_reader));
+            add_entry(decode_scan_entry(entry_reader));
         } else if (response.type == MessageType::manifest_batch) {
             const auto count = entry_reader.u32();
             if (count > 100000) throw Error(ExitCode::transfer, "destination manifest batch entry count exceeds limit");
             manifest.reserve(manifest.size() + count);
-            for (std::uint32_t index = 0; index < count; ++index) add_entry(decode_manifest_entry(entry_reader));
+            for (std::uint32_t index = 0; index < count; ++index) add_entry(decode_scan_entry(entry_reader));
         } else {
             throw Error(ExitCode::transfer, "invalid destination manifest response");
         }
         entry_reader.require_end();
     }
-    return manifest;
+    return result;
 }
 
 void ClientSession::select_root(std::string_view device_path) {
@@ -219,6 +222,26 @@ void ClientSession::commit_file(std::string_view path) {
 }
 void ClientSession::delete_path(std::string_view path) {
     ByteWriter writer; writer.string(path); operation(MessageType::delete_path, std::move(writer).take());
+}
+void ClientSession::record_times(const std::vector<PlannedChange>& records) {
+    std::size_t begin{};
+    while (begin < records.size()) {
+        std::size_t end = begin;
+        std::size_t encoded_size = 4;
+        while (end < records.size()) {
+            const auto next_size = 4U + records[end].entry.path.size() + 1U + 8U + 8U;
+            if (end != begin && encoded_size + next_size > kMaxFramePayload - 1024U) break;
+            if (encoded_size + next_size > kMaxFramePayload)
+                throw Error(ExitCode::safety, "timestamp record has an oversized destination path");
+            encoded_size += next_size;
+            ++end;
+        }
+        ByteWriter writer;
+        writer.u32(static_cast<std::uint32_t>(end - begin));
+        for (std::size_t index = begin; index < end; ++index) encode_manifest_entry(writer, records[index].entry);
+        operation(MessageType::record_times, std::move(writer).take());
+        begin = end;
+    }
 }
 void ClientSession::cancel() noexcept {
     if (!socket_.is_open()) return;

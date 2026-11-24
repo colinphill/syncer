@@ -32,6 +32,16 @@ enum class MessageType : std::uint16_t {
     select_root = 19,
     validate_plan = 20,
     restore = 21,
+    record_times = 22,
+};
+
+// Scan-entry flag: the file's time came from the destination filesystem because the
+// timestamp catalog has no matching record, so it may drift with the device time zone.
+inline constexpr std::uint8_t kScanEntryUntrackedTime = 0x01U;
+
+struct ScanEntry {
+    ManifestEntry entry;
+    std::uint8_t flags{};
 };
 
 enum class UploadPlacement : std::uint8_t { staged = 0, direct = 1 };
@@ -78,6 +88,8 @@ private:
 [[nodiscard]] Frame decode_frame_header(std::span<const std::uint8_t, 16> header);
 void encode_manifest_entry(ByteWriter& writer, const ManifestEntry& entry);
 [[nodiscard]] ManifestEntry decode_manifest_entry(ByteReader& reader);
+void encode_scan_entry(ByteWriter& writer, const ScanEntry& entry);
+[[nodiscard]] ScanEntry decode_scan_entry(ByteReader& reader);
 [[nodiscard]] UploadPlacement decode_upload_placement(ByteReader& reader);
 
 }

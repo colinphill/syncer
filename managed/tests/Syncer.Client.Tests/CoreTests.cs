@@ -138,6 +138,12 @@ public sealed class CoreTests
         Assert.AreEqual(Vector("header_scan_request_42_payload_010203"), Convert.ToHexString(ProtocolCodec.EncodeHeader(frame)).ToLowerInvariant());
         var writer = new ProtocolWriter(); ProtocolCodec.WriteManifestEntry(writer, new("folder/file.bin", EntryType.File, 0x100000002, -123));
         Assert.AreEqual(Vector("manifest_folder_file"), Convert.ToHexString(writer.ToArray()).ToLowerInvariant());
+        var scanWriter = new ProtocolWriter(); var original = new ManifestEntry("folder/file.bin", EntryType.File, 0x100000002, -123);
+        ProtocolCodec.WriteScanEntry(scanWriter, original, ProtocolConstants.ScanEntryUntrackedTime);
+        var scanBytes = scanWriter.ToArray();
+        Assert.AreEqual(Vector("scan_entry_folder_file_untracked"), Convert.ToHexString(scanBytes).ToLowerInvariant());
+        var scanReader = new ProtocolReader(scanBytes); var scanned = ProtocolCodec.ReadScanEntry(ref scanReader); scanReader.RequireEnd();
+        Assert.AreEqual(original, scanned.Entry); Assert.AreEqual(ProtocolConstants.ScanEntryUntrackedTime, scanned.Flags);
         var decoded = ProtocolCodec.DecodeHeader(ProtocolCodec.EncodeHeader(frame)); Assert.AreEqual(MessageType.Scan, decoded.Type); Assert.AreEqual((uint)42, decoded.RequestId); Assert.AreEqual(3, decoded.Payload.Length);
     }
 
@@ -150,6 +156,15 @@ public sealed class CoreTests
         Assert.ThrowsExactly<SyncerException>(() => ProtocolCodec.DecodeHeader(invalid));
         try { var reader = new ProtocolReader([0, 0, 0]); _ = reader.ReadUInt32(); Assert.Fail("Expected a protocol exception."); }
         catch (SyncerException) { }
+        static bool RejectsScanEntry(EntryType type, byte flags)
+        {
+            var writer = new ProtocolWriter(); ProtocolCodec.WriteScanEntry(writer, new("entry", type, 0, 0), flags);
+            try { var reader = new ProtocolReader(writer.ToArray()); _ = ProtocolCodec.ReadScanEntry(ref reader); return false; }
+            catch (SyncerException) { return true; }
+        }
+        Assert.IsTrue(RejectsScanEntry(EntryType.File, 0x02));
+        Assert.IsTrue(RejectsScanEntry(EntryType.Directory, ProtocolConstants.ScanEntryUntrackedTime));
+        Assert.IsFalse(RejectsScanEntry(EntryType.Directory, 0));
     }
 
     [TestMethod]
@@ -175,6 +190,52 @@ public sealed class CoreTests
             ["\U00010000.txt"] = new("\U00010000.txt", EntryType.File, 1, 0), ["\uE000.txt"] = new("\uE000.txt", EntryType.File, 1, 0),
         }, new Dictionary<string, ManifestEntry>(), new GlobSet([]), true, 60);
         Assert.AreEqual("\uE000.txt", unicode.Files[0].Path); Assert.AreEqual("\U00010000.txt", unicode.Files[1].Path);
+        Assert.AreEqual(0, plan.Timestamps.Count);
+    }
+
+    [TestMethod]
+    public void UntrackedDestinationTimesAreRecordedAndToleratedAcrossDaylightSavingShifts()
+    {
+        const long baseTime = 1700000000;
+        var source = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
+        var destination = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
+        var untracked = new HashSet<string>(StringComparer.Ordinal);
+        void Add(string path, ulong size, long time, ulong destinationSize, long destinationTime, bool isUntracked)
+        {
+            source[path] = new(path, EntryType.File, size, time); destination[path] = new(path, EntryType.File, destinationSize, destinationTime);
+            if (isUntracked) untracked.Add(path);
+        }
+        Add("tracked-same.flac", 10, baseTime, 10, baseTime, false);
+        Add("untracked-same.flac", 10, baseTime, 10, baseTime, true);
+        Add("untracked-near.flac", 10, baseTime, 10, baseTime + 30, true);
+        Add("untracked-shift-ahead.flac", 10, baseTime, 10, baseTime + 3600, true);
+        Add("untracked-shift-behind.flac", 10, baseTime, 10, baseTime - 3630, true);
+        Add("tracked-shift.flac", 10, baseTime, 10, baseTime + 3600, false);
+        Add("untracked-two-hours.flac", 10, baseTime, 10, baseTime + 7200, true);
+        Add("untracked-shift-resized.flac", 10, baseTime, 11, baseTime + 3600, true);
+        destination["untracked-extra.flac"] = new("untracked-extra.flac", EntryType.File, 1, 1); untracked.Add("untracked-extra.flac");
+
+        var plan = Planner.MakePlan(source, destination, new GlobSet([]), true, 60, untracked);
+        CollectionAssert.AreEqual(new[] { "untracked-near.flac", "untracked-same.flac", "untracked-shift-ahead.flac", "untracked-shift-behind.flac" },
+            plan.Timestamps.Select(change => change.Path).ToArray());
+        Assert.IsTrue(plan.Timestamps.All(change => change.Action == PlanAction.RecordTimestamp && change.Entry.ModifiedSeconds == baseTime));
+        Assert.AreEqual("destination modification time is not recorded in the timestamp catalog", plan.Timestamps[0].Reason);
+        Assert.AreEqual("destination modification time differs by 3600 seconds (source 1700000000, destination 1700003600), " +
+            "matching a one-hour daylight-saving shift within the tolerance of 60 seconds", plan.Timestamps[2].Reason);
+        StringAssert.Contains(plan.Timestamps[3].Reason, "differs by 3630 seconds");
+        CollectionAssert.AreEqual(new[] { "tracked-shift.flac", "untracked-shift-resized.flac", "untracked-two-hours.flac" },
+            plan.Files.Select(change => change.Path).ToArray());
+        Assert.IsTrue(plan.Files.All(change => change.Action == PlanAction.UpdateFile));
+        Assert.AreEqual((ulong)30, plan.TransferBytes); Assert.AreEqual(1, plan.Deletions.Count);
+
+        var exact = Planner.MakePlan(
+            new Dictionary<string, ManifestEntry> { ["exact.flac"] = new("exact.flac", EntryType.File, 1, baseTime), ["off.flac"] = new("off.flac", EntryType.File, 1, baseTime) },
+            new Dictionary<string, ManifestEntry> { ["exact.flac"] = new("exact.flac", EntryType.File, 1, baseTime - 3600), ["off.flac"] = new("off.flac", EntryType.File, 1, baseTime + 3601) },
+            new GlobSet([]), true, 0, new HashSet<string> { "exact.flac", "off.flac" });
+        Assert.AreEqual("exact.flac", exact.Timestamps.Single().Path); Assert.AreEqual("off.flac", exact.Files.Single().Path);
+
+        var preconditions = Planner.BuildPreconditions(plan, destination);
+        Assert.IsTrue(preconditions.Any(value => value.Path == "untracked-same.flac" && value.Exists && value.Entry == destination["untracked-same.flac"]));
     }
 
     [TestMethod]
@@ -238,7 +299,9 @@ public sealed class CoreTests
     public async Task SavedPlanRoundTripsWithStableDigest()
     {
         var entry = new ManifestEntry("a.txt", EntryType.File, 3, 42); var options = new PushOptions { Exclusions = ["**/*.tmp"], Direct = true, ModificationTimeTolerance = TimeSpan.Zero };
-        var parts = new PlanParts([], [new(entry, PlanAction.AddFile, "destination path is missing")], [], 3);
+        var record = new ManifestEntry("b.txt", EntryType.File, 5, 43);
+        var parts = new PlanParts([], [new(entry, PlanAction.AddFile, "destination path is missing")], [],
+            [new(record, PlanAction.RecordTimestamp, "destination modification time is not recorded in the timestamp catalog")], 3);
         var sourcePath = Path.Combine(Path.GetTempPath(), "source-a.txt"); var sources = new Dictionary<string, SourceFile> { ["a.txt"] = new(entry, sourcePath) };
         var plan = SavedPlans.Create("source", "/sdcard/target", "serial", options, parts, 0, sources, [new("a.txt", false, null)]);
         Assert.AreEqual(Vector("plan_digest_reference"), plan.Digest);
@@ -247,6 +310,7 @@ public sealed class CoreTests
         {
             await SavedPlans.SaveAsync(plan, path, default); var loaded = await SavedPlans.LoadAsync(path, default);
             Assert.AreEqual(plan.Digest, loaded.Digest); Assert.AreEqual(plan.Files[0], loaded.Files[0]); Assert.AreEqual(sourcePath, loaded.SourceFiles["a.txt"].PhysicalPath);
+            Assert.AreEqual(plan.Timestamps[0], loaded.Timestamps.Single()); Assert.IsFalse(loaded.SourceFiles.ContainsKey("b.txt"));
         }
         finally { File.Delete(path); }
     }
@@ -254,9 +318,10 @@ public sealed class CoreTests
     [TestMethod]
     public async Task LoadsNativeProducedPlanFixture()
     {
-        var plan = await SavedPlans.LoadAsync(Path.Combine(AppContext.BaseDirectory, "native-plan-v1.json"), default);
+        var plan = await SavedPlans.LoadAsync(Path.Combine(AppContext.BaseDirectory, "native-plan-v2.json"), default);
         Assert.AreEqual(Vector("plan_digest_reference"), plan.Digest); Assert.AreEqual(PlanAction.AddFile, plan.Files.Single().Action);
         Assert.AreEqual("source-a.txt", plan.SourceFiles["a.txt"].PhysicalPath);
+        Assert.AreEqual(new ManifestEntry("b.txt", EntryType.File, 5, 43), plan.Timestamps.Single().Entry);
     }
 
     [TestMethod]
@@ -293,14 +358,21 @@ public sealed class CoreTests
             using var socket = await listener.AcceptTcpClientAsync(); await using var stream = socket.GetStream();
             var hello = await ProtocolCodec.ReceiveAsync(stream, default); var ack = new ProtocolWriter(); ack.WriteString(ProtocolConstants.Version);
             await ProtocolCodec.SendAsync(stream, new(MessageType.HelloAck, hello.RequestId, ack.ToArray()), default);
-            var scan = await ProtocolCodec.ReceiveAsync(stream, default); var batch = new ProtocolWriter(); batch.WriteUInt32(1); ProtocolCodec.WriteManifestEntry(batch, new("file.txt", EntryType.File, 7, 9));
+            var scan = await ProtocolCodec.ReceiveAsync(stream, default); var batch = new ProtocolWriter(); batch.WriteUInt32(2);
+            ProtocolCodec.WriteScanEntry(batch, new("file.txt", EntryType.File, 7, 9), 0);
+            ProtocolCodec.WriteScanEntry(batch, new("drift.flac", EntryType.File, 8, 10), ProtocolConstants.ScanEntryUntrackedTime);
             await ProtocolCodec.SendAsync(stream, new(MessageType.ManifestBatch, scan.RequestId, batch.ToArray()), default);
             await ProtocolCodec.SendAsync(stream, new(MessageType.ManifestEnd, scan.RequestId, []), default);
+            var record = await ProtocolCodec.ReceiveAsync(stream, default); Assert.AreEqual(MessageType.RecordTimes, record.Type);
+            var reader = new ProtocolReader(record.Payload); Assert.AreEqual(1u, reader.ReadUInt32());
+            Assert.AreEqual(new ManifestEntry("drift.flac", EntryType.File, 8, 3610), ProtocolCodec.ReadManifestEntry(ref reader)); reader.RequireEnd();
+            await ProtocolCodec.SendAsync(stream, new(MessageType.OperationOk, record.RequestId, []), default);
         });
         try
         {
             await using var session = await ClientSession.ConnectAsync(port, "token", default); var manifest = await session.ScanAsync("/sdcard/test", default);
-            Assert.AreEqual((ulong)7, manifest["file.txt"].Size); await peer;
+            Assert.AreEqual((ulong)7, manifest.Entries["file.txt"].Size); CollectionAssert.AreEquivalent(new[] { "drift.flac" }, manifest.UntrackedTimes.ToArray());
+            await session.RecordTimesAsync([new(new("drift.flac", EntryType.File, 8, 3610), PlanAction.RecordTimestamp, "shifted")], default); await peer;
         }
         finally { listener.Stop(); }
     }
@@ -325,7 +397,7 @@ public sealed class CoreTests
         finally { listener.Stop(); }
     }
 
-    private static string Vector(string name) => File.ReadLines(Path.Combine(AppContext.BaseDirectory, "protocol-v6-vectors.txt"))
+    private static string Vector(string name) => File.ReadLines(Path.Combine(AppContext.BaseDirectory, "protocol-v7-vectors.txt"))
         .Where(line => !line.StartsWith('#') && line.Contains('='))
         .Select(line => line.Split('=', 2)).Single(parts => parts[0] == name)[1];
 

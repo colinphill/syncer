@@ -10,6 +10,12 @@
 
 namespace syncer::client {
 
+struct DestinationManifest {
+    Manifest entries;
+    // Files whose destination time came from the filesystem rather than the timestamp catalog.
+    PathSet untracked_times;
+};
+
 class ClientSession {
 public:
     ClientSession(unsigned port, std::string token);
@@ -18,7 +24,7 @@ public:
     ~ClientSession();
 
     void initialize(std::string_view device_path, bool adopt);
-    [[nodiscard]] Manifest scan(std::string_view device_path);
+    [[nodiscard]] DestinationManifest scan(std::string_view device_path);
     void select_root(std::string_view device_path);
     void validate_plan(const std::vector<DestinationPrecondition>& preconditions);
     void restore(std::string_view recovery_id);
@@ -27,6 +33,7 @@ public:
     void make_directory(const ManifestEntry& entry);
     void commit_file(std::string_view path);
     void delete_path(std::string_view path);
+    void record_times(const std::vector<PlannedChange>& records);
     void cancel() noexcept;
     void shutdown() noexcept;
 private:

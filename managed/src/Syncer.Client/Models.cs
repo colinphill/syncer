@@ -71,6 +71,7 @@ public enum PlanAction : byte
     DeleteFile,
     DeleteDirectory,
     DeleteOther,
+    RecordTimestamp,
 }
 
 public sealed record PlannedChange(ManifestEntry Entry, PlanAction Action, string Reason)
@@ -83,7 +84,8 @@ public sealed class SyncPlan
     internal SyncPlan(
         string source, string destination, string deviceSerial, PushOptions options,
         IReadOnlyList<PlannedChange> directories, IReadOnlyList<PlannedChange> files,
-        IReadOnlyList<PlannedChange> deletions, ulong transferBytes, ulong removalCount,
+        IReadOnlyList<PlannedChange> deletions, IReadOnlyList<PlannedChange> timestamps,
+        ulong transferBytes, ulong removalCount,
         string digest, IReadOnlyDictionary<string, SourceFile> sourceFiles,
         IReadOnlyList<DestinationPrecondition> preconditions)
     {
@@ -94,6 +96,7 @@ public sealed class SyncPlan
         Directories = directories;
         Files = files;
         Deletions = deletions;
+        Timestamps = timestamps;
         TransferBytes = transferBytes;
         RemovalCount = removalCount;
         Digest = digest;
@@ -108,6 +111,12 @@ public sealed class SyncPlan
     public IReadOnlyList<PlannedChange> Directories { get; }
     public IReadOnlyList<PlannedChange> Files { get; }
     public IReadOnlyList<PlannedChange> Deletions { get; }
+    /// <summary>
+    /// Unchanged files whose destination time is not yet in the timestamp catalog. Applying
+    /// records the source time without transferring data, so later comparisons cannot drift
+    /// when the destination filesystem reinterprets stored local times.
+    /// </summary>
+    public IReadOnlyList<PlannedChange> Timestamps { get; }
     public ulong TransferBytes { get; }
     public ulong RemovalCount { get; }
     public string Digest { get; }
@@ -117,7 +126,7 @@ public sealed class SyncPlan
     internal IReadOnlyList<DestinationPrecondition> Preconditions { get; }
 }
 
-public sealed record OperationCounts(int Files, int Directories, int Deletions, ulong Bytes = 0);
+public sealed record OperationCounts(int Files, int Directories, int Deletions, ulong Bytes = 0, int Timestamps = 0);
 
 public enum SyncStatus { Success, NoChanges, DryRun, Restored, Initialized }
 
@@ -154,6 +163,7 @@ public enum SyncerProgressStage
     Applying,
     CompletedChange,
     FailedChange,
+    RecordingTimestamps,
 }
 
 public sealed record SyncerProgress(
@@ -161,10 +171,14 @@ public sealed record SyncerProgress(
     string? Path = null,
     PlannedChange? Change = null,
     ulong BytesCompleted = 0,
-    ulong? BytesTotal = null);
+    ulong? BytesTotal = null,
+    int ItemCount = 0);
 
 internal sealed record SourceFile(ManifestEntry Entry, string PhysicalPath);
 internal sealed record SourceTree(
     IReadOnlyDictionary<string, ManifestEntry> Manifest,
     IReadOnlyDictionary<string, SourceFile> Files);
 internal sealed record DestinationPrecondition(string Path, bool Exists, ManifestEntry? Entry);
+internal sealed record DestinationManifest(
+    IReadOnlyDictionary<string, ManifestEntry> Entries,
+    IReadOnlySet<string> UntrackedTimes);

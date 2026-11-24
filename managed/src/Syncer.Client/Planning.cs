@@ -47,6 +47,7 @@ internal sealed record PlanParts(
     IReadOnlyList<PlannedChange> Directories,
     IReadOnlyList<PlannedChange> Files,
     IReadOnlyList<PlannedChange> Deletions,
+    IReadOnlyList<PlannedChange> Timestamps,
     ulong TransferBytes);
 
 internal static class Planner
@@ -61,9 +62,11 @@ internal static class Planner
     public static PlanParts MakePlan(
         IReadOnlyDictionary<string, ManifestEntry> source,
         IReadOnlyDictionary<string, ManifestEntry> destination,
-        GlobSet exclusions, bool deleteExtras, ulong mtimeToleranceSeconds)
+        GlobSet exclusions, bool deleteExtras, ulong mtimeToleranceSeconds,
+        IReadOnlySet<string>? untrackedDestinationTimes = null)
     {
-        var directories = new List<PlannedChange>(); var files = new List<PlannedChange>(); var deletions = new List<PlannedChange>(); ulong bytes = 0;
+        var directories = new List<PlannedChange>(); var files = new List<PlannedChange>(); var deletions = new List<PlannedChange>();
+        var timestamps = new List<PlannedChange>(); ulong bytes = 0;
         foreach (var (path, sourceEntry) in source)
         {
             var exists = destination.TryGetValue(path, out var destinationEntry);
@@ -78,8 +81,17 @@ internal static class Planner
                 PlannedChange? change = null;
                 if (!exists) change = new(sourceEntry, PlanAction.AddFile, "destination path is missing");
                 else if (changedType) change = new(sourceEntry, PlanAction.ReplaceWithFile, $"destination path is a {TypeName(destinationEntry!.Type)}");
-                else if (destinationEntry!.Size != sourceEntry.Size || MtimeDifference(sourceEntry.ModifiedSeconds, destinationEntry.ModifiedSeconds) > mtimeToleranceSeconds)
-                    change = new(sourceEntry, PlanAction.UpdateFile, MetadataReason(sourceEntry, destinationEntry, mtimeToleranceSeconds));
+                else
+                {
+                    var untracked = untrackedDestinationTimes?.Contains(path) == true;
+                    var difference = MtimeDifference(sourceEntry.ModifiedSeconds, destinationEntry!.ModifiedSeconds);
+                    if (destinationEntry.Size != sourceEntry.Size ||
+                        (difference > mtimeToleranceSeconds && !(untracked && MatchesDaylightSavingShift(difference, mtimeToleranceSeconds))))
+                        change = new(sourceEntry, PlanAction.UpdateFile, MetadataReason(sourceEntry, destinationEntry, mtimeToleranceSeconds));
+                    else if (untracked)
+                        timestamps.Add(new(sourceEntry, PlanAction.RecordTimestamp, difference > mtimeToleranceSeconds
+                            ? DaylightSavingShiftReason(sourceEntry, destinationEntry, mtimeToleranceSeconds) : UntrackedTimeReason));
+                }
                 if (change is not null) { files.Add(change); bytes += sourceEntry.Size; }
             }
         }
@@ -89,8 +101,9 @@ internal static class Planner
                     deletions.Add(new(entry, DeletionAction(entry.Type), "path exists only at the destination and deletion is enabled"));
         directories.Sort((left, right) => { var depth = PathDepth(left.Path).CompareTo(PathDepth(right.Path)); return depth != 0 ? depth : Utf8PathComparer.Instance.Compare(left.Path, right.Path); });
         files.Sort((left, right) => Utf8PathComparer.Instance.Compare(left.Path, right.Path));
+        timestamps.Sort((left, right) => Utf8PathComparer.Instance.Compare(left.Path, right.Path));
         deletions.Sort((left, right) => { var depth = PathDepth(right.Path).CompareTo(PathDepth(left.Path)); return depth != 0 ? depth : Utf8PathComparer.Instance.Compare(right.Path, left.Path); });
-        return new(directories, files, deletions, bytes);
+        return new(directories, files, deletions, timestamps, bytes);
     }
 
     public static IReadOnlyList<DestinationPrecondition> BuildPreconditions(PlanParts plan, IReadOnlyDictionary<string, ManifestEntry> destination)
@@ -107,6 +120,7 @@ internal static class Planner
         foreach (var change in plan.Directories) AddChange(change);
         foreach (var change in plan.Files) AddChange(change);
         foreach (var change in plan.Deletions) AddChange(change);
+        foreach (var change in plan.Timestamps) AddChange(change);
         return values.Values.ToArray();
     }
 
@@ -122,6 +136,17 @@ internal static class Planner
         return (ulong)removals.Count;
     }
 
+    /// <summary>
+    /// Destination filesystems that store local time (FAT, exFAT without a valid UTC offset)
+    /// reinterpret stored times when the device's daylight-saving offset changes.
+    /// </summary>
+    internal const ulong DaylightSavingShiftSeconds = 3600;
+    private const string UntrackedTimeReason = "destination modification time is not recorded in the timestamp catalog";
+    private static bool MatchesDaylightSavingShift(ulong difference, ulong tolerance) =>
+        (difference >= DaylightSavingShiftSeconds ? difference - DaylightSavingShiftSeconds : DaylightSavingShiftSeconds - difference) <= tolerance;
+    private static string DaylightSavingShiftReason(ManifestEntry source, ManifestEntry destination, ulong tolerance) =>
+        $"destination modification time differs by {MtimeDifference(source.ModifiedSeconds, destination.ModifiedSeconds)} seconds " +
+        $"(source {source.ModifiedSeconds}, destination {destination.ModifiedSeconds}), matching a one-hour daylight-saving shift within the tolerance of {tolerance} seconds";
     private static ulong MtimeDifference(long left, long right) => left >= right ? (ulong)left - (ulong)right : (ulong)right - (ulong)left;
     private static string MetadataReason(ManifestEntry source, ManifestEntry destination, ulong tolerance)
     {

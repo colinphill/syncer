@@ -69,13 +69,17 @@ internal static class Tool
                 var plan = await client.PlanPushAsync(parse.GetValue(source)!, parse.GetValue(destination)!, pushOptions, progress, token);
                 if (savePath is not null) await client.SavePlanAsync(plan, savePath, token);
                 if (parse.GetValue(json)) WriteJson(PlanJson(plan, started.Elapsed, savePath));
-                else Console.Out.WriteLine($"Dry run: {plan.Files.Count} file(s), {plan.Directories.Count} directorie(s), {plan.Deletions.Count} deletion(s), {plan.TransferBytes} byte(s)");
+                else
+                {
+                    if (plan.Timestamps.Count != 0) Console.Error.WriteLine(TimestampRecordsLine(plan.Timestamps.Count));
+                    Console.Out.WriteLine($"Dry run: {plan.Files.Count} file(s), {plan.Directories.Count} directorie(s), {plan.Deletions.Count} deletion(s), {plan.TransferBytes} byte(s){TimestampSuffix(plan.Timestamps.Count)}");
+                }
             }
             else
             {
                 var result = await client.PushAsync(parse.GetValue(source)!, parse.GetValue(destination)!, pushOptions, progress, token);
                 if (parse.GetValue(json)) WriteJson(ResultJson(result));
-                else Console.Out.WriteLine($"Synchronized: {result.Planned.Files} file(s), {result.Planned.Directories} directorie(s), {result.Planned.Deletions} deletion(s), {result.Planned.Bytes} byte(s)");
+                else Console.Out.WriteLine($"Synchronized: {result.Planned.Files} file(s), {result.Planned.Directories} directorie(s), {result.Planned.Deletions} deletion(s), {result.Planned.Bytes} byte(s){TimestampSuffix(result.Applied.Timestamps)}");
             }
             return 0;
         }));
@@ -92,7 +96,7 @@ internal static class Tool
             var client = Client(parse, adb, serial); var path = parse.GetValue(planPath)!; var plan = await client.LoadPlanAsync(path, token);
             var result = (await client.ApplyPlanAsync(plan, new InlineProgress(RenderProgress), token)) with { PlanFile = path };
             if (parse.GetValue(json)) WriteJson(ResultJson(result));
-            else Console.Out.WriteLine($"Applied saved plan: {result.Planned.Files} file(s), {result.Planned.Directories} directorie(s), {result.Planned.Deletions} deletion(s), {result.Planned.Bytes} byte(s)");
+            else Console.Out.WriteLine($"Applied saved plan: {result.Planned.Files} file(s), {result.Planned.Directories} directorie(s), {result.Planned.Deletions} deletion(s), {result.Planned.Bytes} byte(s){TimestampSuffix(result.Applied.Timestamps)}");
             return 0;
         }));
         return command;
@@ -187,8 +191,12 @@ internal static class Tool
             case SyncerProgressStage.SelectedChange when value.Change is not null: Console.Error.WriteLine($"  {ActionName(value.Change.Action)} \"{value.Change.Path}\" -- {value.Change.Reason}"); break;
             case SyncerProgressStage.StagingFile when value.BytesCompleted == 0: Console.Error.WriteLine($"Staging {value.Path}"); break;
             case SyncerProgressStage.TransferringFile when value.BytesCompleted == 0: Console.Error.WriteLine($"Transferring {value.Path}"); break;
+            case SyncerProgressStage.RecordingTimestamps: Console.Error.WriteLine($"Recording {value.ItemCount} destination timestamp(s)"); break;
         }
     }
+    private static string TimestampRecordsLine(int count) =>
+        $"Timestamp records: {count} unchanged file(s) will have their destination time recorded without transferring data";
+    private static string TimestampSuffix(int count) => count == 0 ? string.Empty : $", {count} timestamp record(s)";
     private static string ActionName(PlanAction action) => action switch
     {
         PlanAction.CreateDirectory => "CREATE DIRECTORY", PlanAction.ReplaceWithDirectory => "REPLACE WITH DIRECTORY",
@@ -212,7 +220,7 @@ internal static class Tool
         ["direct"] = plan.Options.Direct, ["mtime_tolerance_seconds"] = (long)plan.Options.ModificationTimeTolerance.TotalSeconds,
         ["max_removals"] = plan.Options.MaximumRemovals is { } max ? JsonValue.Create(max) : null, ["removal_count"] = plan.RemovalCount,
         ["plan_digest"] = plan.Digest, ["plan_file"] = path, ["actions"] = ActionsJson(plan.Directories.Concat(plan.Files).Concat(plan.Deletions)),
-        ["recovery_id"] = null, ["planned"] = CountsJson(new(plan.Files.Count, plan.Directories.Count, plan.Deletions.Count, plan.TransferBytes)),
+        ["recovery_id"] = null, ["planned"] = CountsJson(new(plan.Files.Count, plan.Directories.Count, plan.Deletions.Count, plan.TransferBytes, plan.Timestamps.Count)),
         ["applied"] = CountsJson(new(0, 0, 0)), ["quarantined_count"] = 0, ["transferred_bytes"] = 0, ["duration_ms"] = (long)duration.TotalMilliseconds, ["error"] = null,
     };
     private static JsonObject ErrorJson(int code, string message) => new()
@@ -248,7 +256,7 @@ internal static class Tool
         ["devices"] = new JsonArray(),
         ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
     };
-    private static JsonObject CountsJson(OperationCounts value) => new() { ["files"] = value.Files, ["directories"] = value.Directories, ["deletions"] = value.Deletions, ["bytes"] = value.Bytes };
+    private static JsonObject CountsJson(OperationCounts value) => new() { ["files"] = value.Files, ["directories"] = value.Directories, ["deletions"] = value.Deletions, ["bytes"] = value.Bytes, ["timestamps"] = value.Timestamps };
     private static JsonArray ActionsJson(IEnumerable<PlannedChange> actions) => new(actions.Select(change => (JsonNode)new JsonObject
     {
         ["action"] = ActionId(change.Action), ["path"] = change.Path, ["reason"] = change.Reason,

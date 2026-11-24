@@ -47,6 +47,8 @@ The server canonicalizes destinations and requires them strictly below internal 
 
 The server attempts to apply source file modification times directly. When an Android shared-storage implementation rejects timestamp changes, `.syncer/timestamps` records versioned logical file times. Destination scans use a logical time only while the entry type and file size still match, preventing needless retransfers while retaining detection of ordinary external changes. Planning ignores file modification-time differences of up to 60 seconds by default; `--mtime-tolerance` overrides that threshold. Directory modification times are normalized to zero during scans and are never compared, applied, or cataloged.
 
+FAT and exFAT store local time; when an entry lacks a valid UTC offset, or a vendor driver ignores it, the kernel converts with its current time-zone offset, which Android updates at daylight-saving changes. Raw destination times can therefore move by an hour twice a year. Scans flag every file whose time did not come from the catalog. Planning turns an unchanged, flagged file into a timestamp record, which stores the source time in the catalog without transferring data, so the file is immune to later shifts. A flagged file whose time differs by one hour (plus or minus the tolerance) is also recorded instead of re-uploaded; catalog-backed files never receive that allowance. Timestamp records are part of the plan digest and saved plan, but not of the content-change lists.
+
 ## Release layout
 
 ```text

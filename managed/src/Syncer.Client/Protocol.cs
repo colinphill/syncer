@@ -6,11 +6,13 @@ namespace Syncer;
 internal static class ProtocolConstants
 {
     public const string Version = "0.2.0";
-    public const ushort ProtocolVersion = 6;
+    public const ushort ProtocolVersion = 7;
     public const uint Magic = 0x53594e43;
     public const int MaximumPayload = 2 * 1024 * 1024;
     public const int TransferChunkSize = 1024 * 1024;
     public const string ReservedDirectory = ".syncer";
+    /// <summary>Scan-entry flag: the file time came from the destination filesystem, not the timestamp catalog.</summary>
+    public const byte ScanEntryUntrackedTime = 0x01;
 }
 
 internal enum MessageType : ushort
@@ -20,6 +22,7 @@ internal enum MessageType : ushort
     PutEnd = 10, CommitFile = 11, DeletePath = 12, SetMtime = 13,
     OperationOk = 14, Error = 15, Shutdown = 16, ManifestBatch = 17,
     Prepare = 18, SelectRoot = 19, ValidatePlan = 20, Restore = 21,
+    RecordTimes = 22,
 }
 
 internal enum UploadPlacement : byte { Staged = 0, Direct = 1 }
@@ -141,6 +144,18 @@ internal static class ProtocolCodec
     {
         writer.WriteString(entry.Path); writer.WriteByte((byte)entry.Type);
         writer.WriteUInt64(entry.Size); writer.WriteInt64(entry.ModifiedSeconds);
+    }
+
+    public static void WriteScanEntry(ProtocolWriter writer, ManifestEntry entry, byte flags)
+    { WriteManifestEntry(writer, entry); writer.WriteByte(flags); }
+
+    public static (ManifestEntry Entry, byte Flags) ReadScanEntry(ref ProtocolReader reader)
+    {
+        var entry = ReadManifestEntry(ref reader); var flags = reader.ReadByte();
+        if ((flags & ~ProtocolConstants.ScanEntryUntrackedTime) != 0 ||
+            ((flags & ProtocolConstants.ScanEntryUntrackedTime) != 0 && entry.Type != EntryType.File))
+            throw new SyncerException(SyncerErrorCode.Transfer, "invalid manifest entry flags");
+        return (entry, flags);
     }
 
     public static ManifestEntry ReadManifestEntry(ref ProtocolReader reader)
